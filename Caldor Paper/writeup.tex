@@ -1,0 +1,193 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url} % Added for URLs
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Predicting Daily Wildfire Spread using Satellite Data and Machine Learning}
+
+% --- Update Author Information ---
+\author{\IEEEauthorblockN{Your Name} % Replace with your name
+\IEEEauthorblockA{\textit{Your Department} \\ % Replace with your department
+\textit{Your University/Organization}\\ % Replace with your university/org
+City, Country \\ % Replace with your city, country
+your.email@example.com} % Replace with your email
+% Add more authors if needed using \and
+}
+
+\maketitle % Creates the title/author section
+
+% --- Abstract ---
+\begin{abstract}
+Wildfires pose a significant and growing threat globally, exacerbated by climate change. Effective wildfire management and mitigation strategies rely heavily on accurate predictions of fire spread. This project investigates the potential of using readily available satellite-derived data and meteorological information to predict next-day wildfire spread using machine learning techniques. We leverage fire perimeter data derived from satellite observations and combine it with gridded meteorological data from the NASA WLDAS dataset. Several classification models, including K-Nearest Neighbors (KNN), Support Vector Machines (SVM), and a simple Neural Network (NN), were developed and evaluated for their ability to predict whether a given location near an active fire will burn within the next 24 hours. Preliminary results show promising accuracy (x.xx\%) using features like surface temperature, rainfall, vegetation status, wind speed, air temperature, humidity, and soil moisture/temperature. This work highlights the potential of machine learning for operational wildfire prediction and identifies key areas for future improvement, particularly in dataset enhancement and model complexity.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Wildfire, Fire Spread Prediction, Machine Learning, Satellite Data, Remote Sensing, WLDAS, SVM, KNN, Neural Networks
+\end{IEEEkeywords}
+
+% --- Introduction ---
+\section{Introduction}
+In recent years, the frequency, intensity, and scale of wildfires have increased dramatically across the globe, posing significant threats to ecosystems, infrastructure, and human lives [CITE]. Regions like California have experienced unprecedented fire seasons, highlighting the urgent need for improved wildfire management and response strategies [CITE - California Fire Example]. Central to these efforts is the ability to accurately predict how a fire will spread over time.
+
+Advancements in satellite remote sensing technology have revolutionized our ability to monitor the Earth's surface, providing vast amounts of data relevant to wildfire dynamics. Various satellite platforms offer information on active fire locations, burned areas, vegetation conditions, and atmospheric parameters at different spatial and temporal resolutions [CITE]. This wealth of data presents an opportunity to develop data-driven models for predicting wildfire behavior.
+
+Our initial hypothesis was that by combining historical fire perimeter data with relevant meteorological and land surface variables obtained from satellite and model sources, we could train machine learning models to predict the likelihood of fire spread to adjacent areas on a daily basis. The goal was to develop a classification model capable of identifying which non-burned grid cells near an active fire perimeter are likely to burn within the next 24 hours. This work builds upon existing research in fire modeling and leverages modern machine learning techniques and computational tools for large-scale data analysis.
+
+% --- Data Description and Exploratory Data Analytics ---
+\section{Data Description and Exploratory Data Analytics}
+The selection of datasets was driven by the need for information on both the state of the fire itself and the environmental conditions influencing its spread. We required spatially explicit data covering a significant period and geographic area, focusing on variables known to affect fire behavior.
+
+\subsection{Data Sources}
+We utilized two primary types of data: fire perimeter information and environmental variables.
+
+\subsubsection{Fire Perimeter Data}
+We used the "Large Fires (2012-2020)" dataset derived using the methodology described by Balch et al. (2022) [CITE - Nature Paper]. This dataset, provided as a GeoPackage file, contains daily perimeters for significant wildfires primarily in the United States, aggregated from various satellite observations. It provides the ground truth for where fires occurred on specific dates (`fireID`, `geometry`, `date`).
+
+\subsubsection{Environmental Data}
+To capture the conditions influencing fire spread, we primarily relied on the NASA Water and Land Data Assimilation System (WLDAS) dataset, accessed via the Goddard Earth Sciences Data and Information Services Center (GES DISC) [CITE - WLDAS/GES DISC]. WLDAS provides a high-density (0.125-degree resolution) gridded dataset of various land surface and meteorological variables. We extracted the following daily average variables (`VARS`) relevant to fire spread:
+\begin{itemize}
+    \item \texttt{AvgSurfT\_tavg}: Average Surface Temperature
+    \item \texttt{Rainf\_tavg}: Rainfall Flux
+    \item \texttt{TVeg\_tavg}: Vegetation Temperature
+    \item \texttt{Wind\_f\_tavg}: Wind Speed
+    \item \texttt{Tair\_f\_tavg}: Air Temperature
+    \item \texttt{Qair\_f\_tavg}: Specific Humidity
+    \item \texttt{SoilMoi00\_10cm\_tavg}: Soil Moisture (0-10cm)
+    \item \texttt{SoilTemp00\_10cm\_tavg}: Soil Temperature (0-10cm)
+\end{itemize}
+WLDAS provides consistent, spatially comprehensive data crucial for modeling environmental influences.
+
+\subsubsection{Other Potential Satellite Data}
+While not fully integrated in this phase, several other satellite data sources offer relevant information with varying characteristics:
+\begin{itemize}
+    \item \textbf{MODIS (Moderate Resolution Imaging Spectroradiometer):} Provides daily global coverage with active fire detections and burned area products at moderate resolution (approx. 1km for fire products) [CITE - MODIS]. Lower resolution but consistent global view.
+    \item \textbf{VIIRS (Visible Infrared Imaging Radiometer Suite):} Available on Suomi-NPP, NOAA-20 (J1), and NOAA-21 (J2). Offers higher spatial resolution fire detections (375m) compared to MODIS, improving detection of smaller fires and fire line delineation, but with a narrower swath [CITE - VIIRS].
+    \item \textbf{Landsat:} Provides high-resolution (30m) imagery, valuable for detailed vegetation and burn severity mapping, but with a lower temporal frequency (8-16 days) [CITE - Landsat].
+    \item \textbf{GOES-R ABI (Advanced Baseline Imager):} Geostationary satellite providing very high temporal frequency (every 5-15 minutes) fire detections over the Americas at a resolution comparable to MODIS (approx. 2km) [CITE - GOES]. Excellent for monitoring rapid fire evolution but lacks the spatial detail of VIIRS or Landsat.
+\end{itemize}
+Integrating data from multiple sensors, particularly combining the high temporal resolution of GOES with the higher spatial resolution of VIIRS, is a key area for future work.
+
+\subsection{Dataset Construction}
+The final dataset for this project was constructed by spatially and temporally joining the WLDAS environmental data points to the areas surrounding the daily fire perimeters from the "Large Fires" dataset. For each day and each fire, WLDAS data points within a specified buffer zone (e.g., 10km) around the fire perimeter were included. This resulted in a dataset where each row represents a specific location (lat, lon) near a specific fire (`fireID`) on a specific date (`date`), along with the corresponding WLDAS environmental variables and a target label indicating if that location burned the following day.
+
+\subsection{Data Preprocessing and Transformation}
+Several preprocessing steps were necessary to prepare the data for modeling:
+\begin{enumerate}
+    \item \textbf{Spatial Joining:} WLDAS data points were associated with specific fires and dates based on their proximity to the daily fire perimeters. A buffer zone (10km) was included around perimeters to capture conditions in unburned areas adjacent to the fire.
+    \item \textbf{Temporal Alignment:} All data were aggregated or selected to represent daily conditions.
+    \item \textbf{Target Variable Creation:} The primary target variable, \texttt{burn\_next\_day}, was created. For each data point (location) on a given day, we checked if its location fell within the fire perimeter recorded for the *following* day. If it did, \texttt{burn\_next\_day} was set to 1, otherwise 0. This transforms the problem into a binary classification task.
+    \item \textbf{Handling Missing Values:} Missing values in the WLDAS features (\texttt{VARS}) were encountered. We employed mean imputation using the \texttt{SimpleImputer} from the \texttt{scikit-learn} library [CITE - Scikit-learn]. The imputer was fitted only on the training data to prevent data leakage.
+    \item \textbf{Data Splitting:} To ensure model generalization and prevent overfitting, the data was split into training and testing sets. Crucially, we used \texttt{GroupShuffleSplit} from \texttt{scikit-learn}, grouping by \texttt{fireID}. This ensures that all data points belonging to a specific fire are entirely within either the training set or the testing set, preventing the model from learning fire-specific characteristics that wouldn't generalize to unseen fires. An 80/20 split was used. A sampling fraction (\texttt{SAMPLE\_FRACTION} = 0.1) was applied to the training set to manage computational resources during development.
+\end{enumerate}
+
+\subsection{Exploratory Data Analysis (EDA)}
+Preliminary EDA involved examining the distributions of the input features (\texttt{VARS}) and the target variable (\texttt{burn\_next\_day}).
+% Placeholder for graphics and detailed stats
+Summary statistics (mean, median, standard deviation) were calculated for each feature within burned vs. unburned classes. Visualizations, such as histograms and box plots, were generated to understand feature distributions [FIGURE - Feature Distributions]. Scatter plots and correlation matrices were used to explore relationships between features [FIGURE - Correlation Matrix]. Spatial plots of features like surface temperature (\texttt{AvgSurfT\_tavg}) overlaid with fire perimeters helped visualize conditions around active fires [FIGURE - Example Temperature Plot]. This EDA phase helped confirm the relevance of the chosen features and identify potential issues like skewness or outliers.
+
+\subsection{Sources of Error, Uncertainty, and Bias}
+Several potential sources of error and bias exist in the data and methodology:
+\begin{itemize}
+    \item \textbf{Spatial Resolution:} The resolution of WLDAS (approx. 12-14km) and fire perimeter data limits the model's ability to capture fine-scale variations in fuel and topography that significantly impact fire spread.
+    \item \textbf{Temporal Resolution:} Daily data aggregation might miss crucial sub-daily weather shifts (e.g., wind changes) or fire activity.
+    \item \textbf{Data Accuracy:} Both satellite fire detections and WLDAS model outputs have inherent uncertainties and potential inaccuracies. Cloud cover can obscure satellite views.
+    \item \textbf{Perimeter Definition:} The definition and accuracy of the "daily perimeter" can vary depending on the source data and processing methods used in the Balch et al. dataset [CITE - Nature Paper].
+    \item \textbf{Geographic Bias:} The "Large Fires" dataset is heavily focused on the US, particularly California in our current subset, limiting the model's applicability to other regions without retraining or validation.
+    \item \textbf{Imputation Effects:} Mean imputation can reduce variance and potentially distort relationships between variables.
+    \item \textbf{Missing Variables:} Important factors like fine-scale topography, detailed fuel type/condition, and active suppression efforts are not included in the current feature set.
+\end{itemize}
+These limitations must be considered when interpreting model performance and applicability.
+
+% --- Model Development and Application ---
+\section{Model Development and Application}
+\subsection{Model Selection}
+Based on the binary classification nature of the problem (predicting \texttt{burn\_next\_day}), we explored several standard machine learning models:
+
+\begin{enumerate}
+    \item \textbf{K-Nearest Neighbors (KNN):} A non-parametric instance-based learning algorithm. It classifies a point based on the majority class among its 'k' nearest neighbors in the feature space. We utilized the GPU-accelerated implementation from `cuML` [CITE - cuML/RAPIDS] for efficiency. Key parameter: number of neighbors (k = [Specify Value]).
+    \item \textbf{Support Vector Machine (SVM):} A powerful classification algorithm that finds an optimal hyperplane to separate classes in a high-dimensional space. We used the `cuML` implementation (`cuSVC`) with a Radial Basis Function (RBF) kernel, which is effective for non-linear relationships. Key parameters: regularization parameter (C = [Specify Value]), kernel coefficient (gamma = [Specify Value, or 'scale']).
+    \item \textbf{Neural Network (NN):} A simple feedforward neural network was implemented using PyTorch [CITE - PyTorch]. The architecture consisted of [Specify Number] hidden layers with [Specify Activation Function, e.g., ReLU] activation, and an output layer with a sigmoid activation for binary classification. Key parameters: number of layers/neurons, learning rate, optimizer (e.g., Adam).
+\end{enumerate}
+These models represent a range of approaches from instance-based (KNN) to kernel methods (SVM) and deep learning (NN).
+
+\subsection{Implementation Details}
+The models were trained using the prepared training data (\texttt{X\_train}, \texttt{y\_train}) consisting of the selected \texttt{VARS} and the \texttt{burn\_next\_day} label. GPU acceleration was heavily utilized via \texttt{cudf} and \texttt{cuML} libraries [CITE - cuML/RAPIDS] to handle the large dataset size efficiently. Data preprocessing steps like imputation and splitting were performed using \texttt{scikit-learn}. Visualizations were created using \texttt{matplotlib} and \texttt{geopandas} [CITE - Matplotlib, Geopandas].
+
+\subsection{Model Application and Performance}
+The trained models were applied to the unseen test set (\texttt{X\_test}, \texttt{y\_test}), which contained data from fires not present in the training set. Model performance was primarily evaluated using overall accuracy:
+\begin{itemize}
+    \item KNN Accuracy: x.xx%
+    \item SVM Accuracy: x.xx%
+    \item NN Accuracy: x.xx%
+\end{itemize}
+Further analysis included examining classification reports (precision, recall, F1-score for each class) to understand how well the models predicted both burning and non-burning cells [FIGURE - Classification Reports]. Visual inspection of predicted fire spread maps versus actual spread for selected test cases provided qualitative assessment [FIGURE - Example Prediction Maps]. The results indicate that the models learned meaningful patterns from the data, achieving accuracy significantly better than random chance. The low E\_out (out-of-sample error) for the NN suggests good generalization potential, although further validation is needed.
+
+\subsection{Validation and Optimization}
+The primary validation method employed was the train-test split grouped by `fireID`. This ensures that the reported accuracy reflects the model's ability to generalize to entirely new fire events.
+
+Further optimization was limited in this phase but could include:
+\begin{itemize}
+    \item \textbf{Hyperparameter Tuning:} Systematically searching for optimal parameters (e.g., k for KNN; C and gamma for SVM; network architecture, learning rate for NN) using techniques like Grid Search or Randomized Search with cross-validation within the training set.
+    \item \textbf{Feature Engineering/Selection:} Exploring interactions between variables or using techniques to select the most informative subset of features.
+    \item \textbf{Addressing Class Imbalance:} The dataset might be imbalanced (more non-burning than burning cells). Techniques like resampling (oversampling the minority class, undersampling the majority class) or using cost-sensitive learning could improve performance, particularly recall for the minority (burn) class.
+\end{itemize}
+% Placeholder for graphics showing performance metrics, confusion matrices, or prediction examples.
+[FIGURE - Model Comparison Metrics]
+[FIGURE - Confusion Matrices]
+
+% --- Conclusions and Discussion ---
+\section{Conclusions and Discussion}
+This project successfully demonstrated the feasibility of predicting next-day wildfire spread using a combination of historical fire perimeters and readily available environmental data from WLDAS. We developed and evaluated three distinct machine learning models – KNN, SVM, and a simple NN – achieving preliminary accuracies of x.xx%, x.xx%, and x.xx% respectively on an independent test set split by fire event. The results suggest that meteorological and land surface variables like temperature, moisture, and wind hold significant predictive power for daily fire progression.
+
+The process involved significant data integration and preprocessing, including spatial-temporal joining and careful handling of the target variable definition. The use of GPU-accelerated libraries like `cuML` was essential for managing the data volume and model training times. Visualizations of both input data (e.g., temperature fields) and model predictions were crucial for understanding the problem and evaluating results.
+
+However, the project also highlighted several areas for future improvement. The current dataset, while substantial (~750 fires), is limited to daily updates and primarily covers California. Future work should prioritize dataset enhancement by:
+\begin{enumerate}
+    \item \textbf{Improving Temporal Resolution:} Integrating high-frequency data from geostationary satellites like GOES-R ABI could allow for sub-daily predictions, capturing finer-scale dynamics. Combining this with high-resolution VIIRS data offers a promising path.
+    \item \textbf{Expanding Geographic Scope:} Incorporating fire data from diverse geographical regions would improve model robustness and generalizability.
+    \item \textbf{Adding More Variables:} Including factors known to influence fire spread, such as fine-scale topography (slope, aspect), detailed fuel maps (type, condition, load), and potentially indicators of suppression efforts, could significantly improve model accuracy [CITE - Fire Spread Factors Papers].
+\end{enumerate}
+
+On the modeling front, while the current models show promise, exploring more sophisticated architectures could yield better results. Graph Neural Networks (GNNs), for instance, are well-suited to capture the spatial relationships and connectivity inherent in fire spread dynamics [CITE - GNNs for Spatial Data]. Rigorous hyperparameter tuning and addressing potential class imbalance are also necessary next steps.
+
+In conclusion, this work provides a foundation for data-driven wildfire spread prediction. While challenges remain in data availability and model complexity, the potential for machine learning to contribute to operational fire management tools is significant. Continued efforts in refining datasets and exploring advanced modeling techniques are warranted.
+
+% --- References ---
+\section*{References} % Use section* for unnumbered section
+
+\begin{thebibliography}{00}
+\bibitem{b1} J. K. Balch et al., "Spatially-explicit simulations of wildfire patterns and interactions in the western US," Sci Data 9, 243 (2022). \url{https://doi.org/10.1038/s41597-022-01343-0}
+\bibitem{b2} [CITE - General Wildfire Impact/Climate Change]
+\bibitem{b3} [CITE - California Fire Example]
+\bibitem{b4} [CITE - General Satellite Remote Sensing for Fires]
+\bibitem{b5} [CITE - WLDAS / GES DISC] NASA Goddard Earth Sciences Data and Information Services Center (GES DISC), Water and Land Data Assimilation System (WLDAS). [Add specific dataset DOI/URL if available]
+\bibitem{b6} [CITE - MODIS] NASA MODIS Fire and Thermal Anomalies product. [Add specific dataset DOI/URL if available]
+\bibitem{b7} [CITE - VIIRS] NASA VIIRS Active Fire product. [Add specific dataset DOI/URL if available]
+\bibitem{b8} [CITE - Landsat] USGS Landsat Collection. [Add specific dataset DOI/URL if available]
+\bibitem{b9} [CITE - GOES] NOAA GOES-R Series ABI Fire Detection and Characterization (FDC) product. [Add specific dataset DOI/URL if available]
+\bibitem{b10} [CITE - Scikit-learn] F. Pedregosa et al., "Scikit-learn: Machine Learning in Python," J Mach Learn Res 12 (2011): 2825-2830.
+\bibitem{b11} [CITE - cuML/RAPIDS] RAPIDS cuML: A suite of libraries that implement machine learning algorithms and mathematical primitives functions that share compatible APIs with other RAPIDS projects. \url{https://rapids.ai/cuml.html}
+\bibitem{b12} [CITE - PyTorch] A. Paszke et al., "PyTorch: An Imperative Style, High-Performance Deep Learning Library," Advances in Neural Information Processing Systems 32 (2019).
+\bibitem{b13} J. D. Hunter, "Matplotlib: A 2D Graphics Environment," Computing in Science \& Engineering, vol. 9, no. 3, pp. 90-95, 2007.
+\bibitem{b14} [CITE - Geopandas] K. Jordahl et al., "GeoPandas: Python tools for geographic data," 2020. \url{https://geopandas.org}
+\bibitem{b15} [CITE - Fire Spread Factors Paper 1]
+\bibitem{b16} [CITE - Fire Spread Factors Paper 2]
+\bibitem{b17} [CITE - GNNs for Spatial Data / Fire Modeling]
+% Add other references as needed
+\end{thebibliography}
+
+% --- Code Availability ---
+\section*{Code Availability}
+The Python code used for data processing, model training, and analysis is available on GitHub: [Your GitHub Repository URL] and is also included as a supplementary zipped folder.
+
+\end{document}

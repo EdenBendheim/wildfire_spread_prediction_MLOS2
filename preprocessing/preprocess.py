@@ -9,6 +9,9 @@ import pandas as pd
 from sklearn.cluster import DBSCAN
 from scipy.spatial import cKDTree
 
+# Add this line to ensure paths are resolved relative to the script location
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 # Earth's radius in kilometers
 R = 6371.0
 
@@ -45,7 +48,7 @@ def filter_points(combined_data, centroids, max_distance_km=20):
     return combined_data[list(filtered_indices)]
 
 print("Reading in fire data...")
-gdf = gpd.read_file('dataframe/dataframe.shp')
+gdf = gpd.read_file('DL_FIRE_J1V-C2_592228/dataframe.shp')
 gdf.dropna(inplace=True)
 print("Finished reading in fire data")
 discretized_lat_lon = False
@@ -63,8 +66,8 @@ variables_t = {
 df_columns = ["time", "date", "lat", "lon"] + list(variables_t)
 df = pd.DataFrame(columns=df_columns)
 
-start_date = "WLDAS_NOAHMP001_DA1_20170717"
-end_date = "WLDAS_NOAHMP001_DA1_20170718"
+start_date = "WLDAS_NOAHMP001_DA1_20230101"
+end_date = "WLDAS_NOAHMP001_DA1_20230131"
 folder_dir = "../dataset/WLDAS"
 for fid, file in tqdm(enumerate(sorted(os.listdir(folder_dir))), total=len(os.listdir(folder_dir))):
 
@@ -119,6 +122,10 @@ for fid, file in tqdm(enumerate(sorted(os.listdir(folder_dir))), total=len(os.li
     filtered_lat = lat[mask_lat]
     filtered_lon = lon[mask_lon]
 
+    # Convert ACQ_DATE to string before using str.contains
+    if not pd.api.types.is_string_dtype(gdf["ACQ_DATE"]):
+        gdf["ACQ_DATE"] = gdf["ACQ_DATE"].astype(str)
+        
     fires = gdf[gdf["ACQ_DATE"].str.contains(date, na=False)]
 
     fire_array = np.zeros((len(lat), len(lon)), dtype=np.uint8)
@@ -143,7 +150,15 @@ for fid, file in tqdm(enumerate(sorted(os.listdir(folder_dir))), total=len(os.li
     # Clustering fire points
     fire_lat_lon = fire_points[:, 2:4]  # Adjust these indices based on your data
     dbscan = DBSCAN(eps=0.05, min_samples=10, metric=lambda u, v: haversine(u[0], u[1], v[0], v[1]))
-    clusters = dbscan.fit_predict(fire_lat_lon)
+    # Check if fire_lat_lon is empty before clustering
+    if len(fire_lat_lon) > 0:
+        # Convert fire_lat_lon to float type if it contains strings
+        fire_lat_lon = fire_lat_lon.astype(float)
+        clusters = dbscan.fit_predict(fire_lat_lon)
+    else:
+        # If no fire points, create empty clusters array
+        clusters = np.array([])
+
     # Calculate centroids of clusters
     centroids = []
     for cluster_id in np.unique(clusters):
@@ -193,6 +208,6 @@ for fid, file in tqdm(enumerate(sorted(os.listdir(folder_dir))), total=len(os.li
     # Now, df is your DataFrame with columns named according to the variable names
     # Save DataFrame to CSV
     file_name = file.split(".")[0]
-    df_filtered.to_csv(f"../dataset/WLDAS_variables/{file_name}.csv", index=False)
+    df_filtered.to_csv(f"../dataset/WLDAS_variables_test/{file_name}.csv", index=False)
     # pickle.dump(data_dict, open(f"../dataset/WLDAS_arrays/{file_name}.pkl", "wb"))
 
