@@ -22,6 +22,20 @@ import os
 from dataclasses import dataclass, field
 from shapely.geometry import Polygon, MultiPolygon
 import warnings
+import matplotlib.pyplot as plt
+import contextily as cx
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
+
+# Machine learning imports
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from shapely.ops import unary_union
+from shapely.affinity import translate, scale
+import random
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -331,52 +345,387 @@ class FireDataCompiler:
         return compiled_fires
 
 
-def main():
-    """Main function to demonstrate the fire data compilation"""
-    print("=== Fire Data Compilation Script ===")
+def add_satellite_basemap(ax, bounds, crs="EPSG:4326"):
+    """Add satellite imagery as a basemap to the given axes.
+    
+    Parameters:
+    -----------
+    ax : matplotlib.axes.Axes
+        The axes to add the basemap to
+    bounds : tuple
+        The (minx, miny, maxx, maxy) bounds in the CRS coordinates
+    crs : str
+        The coordinate reference system of the axes
+    """
+    try:
+        minx, miny, maxx, maxy = bounds
+        
+        # Add the satellite basemap
+        cx.add_basemap(ax, crs=crs, source=cx.providers.Esri.WorldImagery, 
+                      zoom='auto', attribution=False)
+        
+        # Reset the extent to make sure the view doesn't change
+        ax.set_xlim(minx, maxx)
+        ax.set_ylim(miny, maxy)
+    except Exception as e:
+        print(f"Warning: Could not add satellite basemap: {e}")
+
+
+def visualize_fire_progression(fire_dataset: FireDataset, output_dir: str = None, interval_days: int = 5):
+    """
+    Visualize fire progression with TVeg background and satellite imagery.
+    
+    Parameters:
+    -----------
+    fire_dataset : FireDataset
+        The compiled fire dataset to visualize
+    output_dir : str, optional
+        Directory to save images. If None, uses 'fire_{fire_id}_visualization'
+    interval_days : int
+        Show progression every N days (default: 5)
+    """
+    fire_id = fire_dataset.fire_id
+    
+    if output_dir is None:
+        output_dir = f"fire_{fire_id}_visualization"
+    
+    os.makedirs(output_dir, exist_ok=True)
+    daily_dir = os.path.join(output_dir, "daily")
+    os.makedirs(daily_dir, exist_ok=True)
+    
+    # Get all days with data and select every N days
+    all_days = fire_dataset.daily_data
+    
+    if len(all_days) <= 1:
+        interval_days_data = all_days
+    else:
+        # Always include first day
+        interval_days_data = [all_days[0]]
+        # Add every Nth day
+        for i in range(interval_days, len(all_days), interval_days):
+            interval_days_data.append(all_days[i])
+        # Always include last day if not already included
+        if all_days[-1] not in interval_days_data:
+            interval_days_data.append(all_days[-1])
+    
+    print(f"Fire {fire_id}: Visualizing {len(interval_days_data)} days at {interval_days}-day intervals")
+    
+    # Define fire-themed gradient colormap
+    fire_cmap = LinearSegmentedColormap.from_list('fire_gradient', 
+                                                ['#FFFF00', '#FFD700', '#FFA500', '#FF4500', '#FF0000', '#8B0000'])
+    
+    # Calculate overall bounds for the fire (for the final summary image)
+    all_perimeters = []
+    for day_data in all_days:
+        if day_data.cumulative_perimeters:
+            all_perimeters.extend(day_data.cumulative_perimeters)
+    
+    if not all_perimeters:
+        print(f"Warning: No perimeter data found for fire {fire_id}")
+        return
+    
+    # Convert to GeoDataFrame to get overall bounds for summary
+    from shapely.ops import unary_union
+    overall_geom = unary_union(all_perimeters)
+    summary_minx, summary_miny, summary_maxx, summary_maxy = overall_geom.bounds
+    
+    # Add buffer around overall bounds for summary
+    summary_width = summary_maxx - summary_minx
+    summary_height = summary_maxy - summary_miny
+    summary_buffer_x = summary_width * 0.15  # 15% buffer
+    summary_buffer_y = summary_height * 0.15
+    
+    summary_minx -= summary_buffer_x
+    summary_maxx += summary_buffer_x
+    summary_miny -= summary_buffer_y
+    summary_maxy += summary_buffer_y
+    
+    print(f"Fire {fire_id} overall bounds: ({summary_minx:.5f}, {summary_miny:.5f}) to ({summary_maxx:.5f}, {summary_maxy:.5f})")
+    
+    # Create visualizations for each interval day
+    for i, current_day_data in enumerate(interval_days_data):
+        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+        
+        # Calculate dynamic bounds for this specific day
+        days_to_plot = interval_days_data[:i+1]
+        current_perimeters = []
+        for day_data in days_to_plot:
+            if day_data.cumulative_perimeters:
+                current_perimeters.extend(day_data.cumulative_perimeters)
+        
+        if current_perimeters:
+            # Get bounds for fire up to current day
+            current_geom = unary_union(current_perimeters)
+            current_minx, current_miny, current_maxx, current_maxy = current_geom.bounds
+            
+            # Add dynamic buffer based on fire size
+            current_width = current_maxx - current_minx
+            current_height = current_maxy - current_miny
+            
+            # Use larger buffer for smaller fires, smaller buffer for larger fires
+            min_buffer = 0.01  # Minimum buffer in degrees
+            max_buffer_ratio = 0.3  # Maximum buffer as ratio of fire size
+            
+            if current_width < 0.01 or current_height < 0.01:  # Very small fire
+                buffer_x = buffer_y = min_buffer
+            else:
+                buffer_x = max(min_buffer, current_width * max_buffer_ratio)
+                buffer_y = max(min_buffer, current_height * max_buffer_ratio)
+            
+            current_minx -= buffer_x
+            current_maxx += buffer_x
+            current_miny -= buffer_y
+            current_maxy += buffer_y
+        else:
+            # Fallback if no perimeters available
+            current_minx, current_miny, current_maxx, current_maxy = summary_minx, summary_miny, summary_maxx, summary_maxy
+        
+        # Set extent for current day
+        ax.set_xlim(current_minx, current_maxx)
+        ax.set_ylim(current_miny, current_maxy)
+        
+        # Add satellite basemap
+        add_satellite_basemap(ax, (current_minx, current_miny, current_maxx, current_maxy))
+        
+        # Plot TVeg background data if available
+        if current_day_data.ground_data and current_day_data.ground_data.vegetation_transpiration:
+            # Create points from coordinates and TVeg data
+            coords = current_day_data.ground_data.coordinates
+            tveg_values = current_day_data.ground_data.vegetation_transpiration
+            
+            # Filter points within visible bounds
+            visible_coords = []
+            visible_tveg = []
+            for coord, tveg in zip(coords, tveg_values):
+                lat, lon = coord
+                if (current_minx <= lon <= current_maxx and 
+                    current_miny <= lat <= current_maxy and 
+                    not pd.isna(tveg)):
+                    visible_coords.append((lon, lat))  # Note: lon, lat for plotting
+                    visible_tveg.append(tveg)
+            
+            if visible_coords and visible_tveg:
+                # Plot TVeg as scatter points
+                lons, lats = zip(*visible_coords)
+                scatter = ax.scatter(lons, lats, c=visible_tveg, cmap='coolwarm', 
+                                   s=10, alpha=0.7, zorder=5)
+                
+                # Add colorbar for TVeg
+                tveg_cbar = plt.colorbar(scatter, ax=ax, pad=0.01, location='right')
+                tveg_cbar.set_label("Vegetation Transpiration", fontsize=10)
+        
+        # Plot fire perimeters up to current day
+        days_to_plot = interval_days_data[:i+1]
+        num_days = len(days_to_plot)
+        
+        for j, day_data in enumerate(days_to_plot):
+            if day_data.daily_perimeter:
+                # Create GeoDataFrame for plotting
+                gdf = gpd.GeoDataFrame([{'geometry': day_data.daily_perimeter}], crs='EPSG:4326')
+                
+                # Use gradient based on time progression
+                color_val = j / max(1, num_days - 1)
+                perimeter_color = fire_cmap(color_val)
+                
+                gdf.plot(ax=ax, facecolor='none', edgecolor=perimeter_color, 
+                        linewidth=2.5, zorder=j+10)
+        
+        # Add horizontal colorbar for fire progression
+        sm = ScalarMappable(cmap=fire_cmap, norm=Normalize(0, 1))
+        sm.set_array([])
+        
+        cbar_ax = fig.add_axes([0.15, 0.05, 0.7, 0.02])
+        cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+        
+        # Add date labels to colorbar
+        if len(days_to_plot) > 1:
+            start_date = days_to_plot[0].date.strftime("%Y-%m-%d")
+            end_date = days_to_plot[-1].date.strftime("%Y-%m-%d")
+            cbar.ax.set_xticks([0, 1])
+            cbar.ax.set_xticklabels([start_date, end_date])
+            cbar.ax.set_xlabel('Fire Progression Timeline', labelpad=5)
+        else:
+            date_str = days_to_plot[0].date.strftime("%Y-%m-%d")
+            cbar.ax.set_xticks([0.5])
+            cbar.ax.set_xticklabels([date_str])
+        
+        # Set title and labels
+        current_date_str = current_day_data.date.strftime("%Y-%m-%d")
+        ax.set_title(f"Fire {fire_id} Progression Through {current_date_str}", fontsize=14)
+        ax.set_xlabel("Longitude", fontsize=12)
+        ax.set_ylabel("Latitude", fontsize=12)
+        ax.set_aspect("equal", adjustable="datalim")
+        
+        # Save figure
+        fig.subplots_adjust(bottom=0.15, right=0.85)
+        fig.savefig(os.path.join(daily_dir, f"interval_{i:02d}_{current_date_str}.png"), 
+                   dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    
+    # Create final summary visualization
+    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    
+    # Set extent
+    ax.set_xlim(summary_minx, summary_maxx)
+    ax.set_ylim(summary_miny, summary_maxy)
+    
+    # Add satellite basemap
+    add_satellite_basemap(ax, (summary_minx, summary_miny, summary_maxx, summary_maxy))
+    
+    # Plot TVeg from last day if available
+    if interval_days_data[-1].ground_data and interval_days_data[-1].ground_data.vegetation_transpiration:
+        coords = interval_days_data[-1].ground_data.coordinates
+        tveg_values = interval_days_data[-1].ground_data.vegetation_transpiration
+        
+        visible_coords = []
+        visible_tveg = []
+        for coord, tveg in zip(coords, tveg_values):
+            lat, lon = coord
+            if (summary_minx <= lon <= summary_maxx and 
+                summary_miny <= lat <= summary_maxy and 
+                not pd.isna(tveg)):
+                visible_coords.append((lon, lat))
+                visible_tveg.append(tveg)
+        
+        if visible_coords and visible_tveg:
+            lons, lats = zip(*visible_coords)
+            scatter = ax.scatter(lons, lats, c=visible_tveg, cmap='coolwarm', 
+                               s=10, alpha=0.7, zorder=5)
+            tveg_cbar = plt.colorbar(scatter, ax=ax, pad=0.01, location='right')
+            tveg_cbar.set_label("Vegetation Transpiration", fontsize=10)
+    
+    # Plot all interval fire perimeters
+    for j, day_data in enumerate(interval_days_data):
+        if day_data.daily_perimeter:
+            gdf = gpd.GeoDataFrame([{'geometry': day_data.daily_perimeter}], crs='EPSG:4326')
+            
+            color_val = j / max(1, len(interval_days_data) - 1)
+            perimeter_color = fire_cmap(color_val)
+            
+            gdf.plot(ax=ax, facecolor='none', edgecolor=perimeter_color, 
+                    linewidth=2.5, zorder=j+10)
+    
+    # Add colorbar for complete progression
+    sm = ScalarMappable(cmap=fire_cmap, norm=Normalize(0, 1))
+    sm.set_array([])
+    
+    cbar_ax = fig.add_axes([0.15, 0.05, 0.7, 0.02])
+    cbar = fig.colorbar(sm, cax=cbar_ax, orientation='horizontal')
+    
+    if len(interval_days_data) > 1:
+        start_date = interval_days_data[0].date.strftime("%Y-%m-%d")
+        end_date = interval_days_data[-1].date.strftime("%Y-%m-%d")
+        cbar.ax.set_xticks([0, 1])
+        cbar.ax.set_xticklabels([start_date, end_date])
+        cbar.ax.set_xlabel('Fire Progression Timeline', labelpad=5)
+    else:
+        date_str = interval_days_data[0].date.strftime("%Y-%m-%d")
+        cbar.ax.set_xticks([0.5])
+        cbar.ax.set_xticklabels([date_str])
+    
+    ax.set_title(f"Fire {fire_id} - Complete Progression ({interval_days}-day intervals)", fontsize=14)
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+    ax.set_aspect("equal", adjustable="datalim")
+    
+    fig.subplots_adjust(bottom=0.15, right=0.85)
+    fig.savefig(os.path.join(output_dir, f"fire_{fire_id}_complete_progression.png"), 
+               dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    
+    print(f"Fire {fire_id} visualization complete. Saved to {output_dir}")
+
+
+def visualize_fire_by_id(fire_id: int, interval_days: int = 5, 
+                        output_dir: str = None,
+                        perimeter_file: str = "Largefire/LargeFires_2012-2020.gpkg",
+                        ground_data_file: str = "training_dataset.parquet"):
+    """
+    Easy-to-use function to visualize a fire by its ID.
+    
+    Parameters:
+    -----------
+    fire_id : int
+        The ID of the fire to visualize
+    interval_days : int
+        Show progression every N days (default: 5)
+    output_dir : str, optional
+        Directory to save images. If None, uses 'fire_{fire_id}_visualization'
+    perimeter_file : str
+        Path to the fire perimeter data file
+    ground_data_file : str
+        Path to the ground data file
+        
+    Returns:
+    --------
+    FireDataset or None
+        The compiled fire dataset if successful, None otherwise
+    """
+    print(f"=== Visualizing Fire {fire_id} ===")
     
     # Initialize compiler
-    compiler = FireDataCompiler()
+    compiler = FireDataCompiler(perimeter_file, ground_data_file)
     
     # Load data
+    print("Loading data...")
     compiler.load_data()
     
-    # Test with a small subset first (first 5 fires)
-    print("\n=== Testing with first 5 fires ===")
-    perimeter_fire_ids = set(compiler.perimeter_data['fireID'].unique())
-    ground_fire_ids = set(compiler.ground_data['fireID'].unique())
-    common_fire_ids = sorted(perimeter_fire_ids & ground_fire_ids)[:5]
+    # Compile the specific fire
+    print(f"Compiling fire {fire_id}...")
+    fire_dataset = compiler.compile_fire_data(fire_id)
     
-    test_fires = compiler.compile_all_fires(fire_ids=common_fire_ids)
-    
-    # Display sample results
-    print("\n=== Sample Results ===")
-    for fire in test_fires[:2]:  # Show first 2 fires
-        summary = fire.get_summary()
+    if fire_dataset:
+        summary = fire_dataset.get_summary()
         print(f"\nFire {summary['fire_id']}:")
         print(f"  Duration: {summary['duration_days']} days ({summary['start_date']} to {summary['end_date']})")
         print(f"  Max area: {summary['max_area']:.6f}")
         print(f"  Days with ground data: {summary['days_with_ground_data']}")
         print(f"  Total ground data points: {summary['total_ground_data_points']}")
         
-        # Show sample day data
-        if fire.daily_data:
-            sample_day = fire.daily_data[0]
-            print(f"  Sample day ({sample_day.date}):")
-            print(f"    Cumulative perimeters: {len(sample_day.cumulative_perimeters)}")
-            print(f"    Has ground data: {sample_day.has_ground_data}")
-            if sample_day.ground_data:
-                print(f"    Ground data points: {sample_day.ground_data.num_points}")
-                stats = sample_day.ground_data.get_summary_stats()
-                if 'vegetation_transpiration' in stats and 'count' in stats['vegetation_transpiration'] and stats['vegetation_transpiration']['count'] > 0:
-                    print(f"    Avg vegetation transpiration: {stats['vegetation_transpiration']['mean']:.2f}")
-    
-    # Save test results
-    compiler.save_compiled_data(test_fires, "test_compiled_fire_data.pkl")
-    
-    print(f"\n=== Test Complete ===")
-    print(f"Successfully compiled {len(test_fires)} fires.")
-    print("To compile all fires, call: compiler.compile_all_fires()")
+        # Visualize the fire progression
+        print(f"\nCreating visualization...")
+        visualize_fire_progression(fire_dataset, output_dir=output_dir, interval_days=interval_days)
+        
+        output_dir_name = output_dir if output_dir else f"fire_{fire_id}_visualization"
+        print(f"Visualization complete! Check the '{output_dir_name}' directory.")
+        return fire_dataset
+    else:
+        print(f"Fire {fire_id} not found or failed to compile")
+        return None
+
+
+def main():
+    # Load the data and get the fire perimeter for day 10 of fire 2623
+    compiler = FireDataCompiler()
+    compiler.load_data()
+
+    # Compile the specific fire
+    fire_dataset = compiler.compile_fire_data(2623)
+
+    if fire_dataset and len(fire_dataset.daily_data) >= 10:
+        # Get day 10 (index 9 since it's 0-based)
+        day_10_data = fire_dataset.daily_data[9]
+        
+        # Get the perimeter polygon for day 10
+        day_10_perimeter = day_10_data.daily_perimeter
+        
+        if day_10_perimeter:
+            print(f"Fire 2623 Day 10 perimeter loaded successfully")
+            print(f"Date: {day_10_data.date}")
+            print(f"Perimeter type: {type(day_10_perimeter)}")
+            print(f"Perimeter area: {day_10_perimeter.area}")
+            print(f"Perimeter bounds: {day_10_perimeter.bounds}")
+        else:
+            print(f"No perimeter data found for day 10 of fire 2623")
+            # Check if cumulative perimeters are available
+            if day_10_data.cumulative_perimeters:
+                print(f"But cumulative perimeters available: {len(day_10_data.cumulative_perimeters)} polygons")
+    else:
+        print(f"Fire 2623 not found or has fewer than 10 days of data")
+        if fire_dataset:
+            print(f"Fire 2623 has {len(fire_dataset.daily_data)} days of data")
+
+
 
 
 if __name__ == "__main__":
