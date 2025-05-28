@@ -35,6 +35,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from shapely.ops import unary_union
 from shapely.affinity import translate, scale
+from shapely.geometry import LineString, Point
 import random
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -715,6 +716,57 @@ def main():
             print(f"Perimeter type: {type(day_10_perimeter)}")
             print(f"Perimeter area: {day_10_perimeter.area}")
             print(f"Perimeter bounds: {day_10_perimeter.bounds}")
+            
+            # Demonstrate the new MultiPolygon translation functionality
+            print("\n" + "="*60)
+            print("DEMONSTRATING MULTIPOLYGON TRANSLATION FOR ML")
+            print("="*60)
+            
+            # Translate the perimeter to ML features using radial method
+            print("\n1. Converting polygon to ML features (radial method):")
+            features_radial = translate_multipolygon_for_ml(day_10_perimeter, method='radial', n_params=36)
+            print(f"   Original polygon area: {day_10_perimeter.area:.6f}")
+            print(f"   Features shape: {features_radial.shape}")
+            print(f"   Centroid: ({features_radial[0]:.6f}, {features_radial[1]:.6f})")
+            print(f"   Sample radial distances: {features_radial[2:8]}")
+            
+            # Convert back to polygon
+            reconstructed_poly = features_to_polygon(features_radial, method='radial', n_params=36)
+            print(f"   Reconstructed area: {reconstructed_poly.area:.6f}")
+            print(f"   Area preservation ratio: {reconstructed_poly.area/day_10_perimeter.area:.4f}")
+            
+            # Try coordinate method too
+            print("\n2. Converting polygon to ML features (coordinate method):")
+            features_coords = translate_multipolygon_for_ml(day_10_perimeter, method='coordinates', n_params=20)
+            print(f"   Features shape: {features_coords.shape}")
+            print(f"   Sample coordinates: {features_coords[:8]}")
+            
+            # Extract features from entire fire dataset
+            print("\n3. Extracting features from entire fire dataset:")
+            all_features, all_dates = extract_polygon_features_from_fire_dataset(
+                fire_dataset, method='radial', n_params=36
+            )
+            print(f"   Total days with polygon data: {len(all_features)}")
+            if all_features:
+                print(f"   Feature vector length: {len(all_features[0])}")
+                print(f"   Date range: {min(all_dates)} to {max(all_dates)}")
+                
+                # Show progression of fire size
+                areas_over_time = []
+                for i, (features, date) in enumerate(zip(all_features, all_dates)):
+                    reconstructed = features_to_polygon(features, method='radial')
+                    areas_over_time.append(reconstructed.area)
+                    if i < 5:  # Show first 5 days
+                        print(f"   Day {i+1} ({date}): area = {areas_over_time[i]:.6f}")
+                
+                print(f"   Maximum fire area: {max(areas_over_time):.6f}")
+                print(f"   Fire growth ratio: {max(areas_over_time)/areas_over_time[0]:.2f}x")
+            
+            print("\n" + "="*60)
+            print("MultiPolygon translation demonstration complete!")
+            print("Use translate_multipolygon_for_ml() to convert polygons to ML features")
+            print("Use features_to_polygon() to convert ML predictions back to polygons")
+            print("="*60)
         else:
             print(f"No perimeter data found for day 10 of fire 2623")
             # Check if cumulative perimeters are available
@@ -724,9 +776,372 @@ def main():
         print(f"Fire 2623 not found or has fewer than 10 days of data")
         if fire_dataset:
             print(f"Fire 2623 has {len(fire_dataset.daily_data)} days of data")
+        
+        # Still demonstrate the translation functionality with a simple example
+        print("\nDemonstrating MultiPolygon translation with simple example:")
+        demonstrate_multipolygon_translation()
 
 
 
 
 if __name__ == "__main__":
     main()
+
+# Machine learning imports
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from shapely.ops import unary_union
+from shapely.affinity import translate, scale
+from shapely.geometry import LineString, Point
+import random
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+def translate_multipolygon_for_ml(multipolygon, method='radial', n_params=36):
+    """
+    Translate a shapely MultiPolygon object into a numerical feature vector for machine learning.
+    
+    This function converts complex polygon shapes into a standardized numerical representation
+    that can be used as input to machine learning models. Two parameterization methods are 
+    supported:
+    
+    Parameters:
+    -----------
+    multipolygon : shapely.geometry.multipolygon.MultiPolygon or shapely.geometry.polygon.Polygon
+        The input polygon geometry to convert
+    method : str, default='radial'
+        The parameterization method to use:
+        - 'radial': Centroid + radial distances (recommended for fire perimeters)
+        - 'coordinates': Fixed number of coordinate pairs
+    n_params : int, default=36
+        Number of parameters for the parameterization:
+        - For 'radial': Number of radial rays (total features = n_params + 2 for centroid)
+        - For 'coordinates': Number of coordinate pairs (total features = n_params * 2)
+    
+    Returns:
+    --------
+    np.ndarray
+        Feature vector representing the polygon:
+        - For 'radial' method: [centroid_x, centroid_y, dist_0, dist_1, ..., dist_n]
+        - For 'coordinates' method: [x_0, y_0, x_1, y_1, ..., x_n, y_n]
+    
+    Examples:
+    ---------
+    >>> from shapely.geometry import Polygon, MultiPolygon
+    >>> # Single polygon
+    >>> poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+    >>> features = translate_multipolygon_for_ml(poly)
+    >>> print(features.shape)  # (38,) for default radial with 36 params
+    
+    >>> # MultiPolygon (will use largest component)
+    >>> multi = MultiPolygon([poly, Polygon([(2, 2), (3, 2), (3, 3), (2, 3)])])
+    >>> features = translate_multipolygon_for_ml(multi)
+    
+    >>> # Different parameterization
+    >>> features_coords = translate_multipolygon_for_ml(poly, method='coordinates', n_params=20)
+    >>> print(features_coords.shape)  # (40,) for 20 coordinate pairs
+    """
+    
+    # Handle MultiPolygon by taking the largest component
+    if isinstance(multipolygon, MultiPolygon):
+        # Take the polygon with the largest area
+        polygon = max(multipolygon.geoms, key=lambda p: p.area)
+    elif isinstance(multipolygon, Polygon):
+        polygon = multipolygon
+    else:
+        raise ValueError(f"Input must be a Polygon or MultiPolygon, got {type(multipolygon)}")
+    
+    if method == 'radial':
+        return _polygon_to_radial_features(polygon, n_params)
+    elif method == 'coordinates':
+        return _polygon_to_coordinate_features(polygon, n_params)
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'radial' or 'coordinates'")
+
+
+def _polygon_to_radial_features(polygon, n_radial=36):
+    """
+    Convert polygon to centroid + radial distances representation.
+    
+    This method represents a polygon using its centroid coordinates plus distances
+    from the centroid to the polygon boundary at regular angular intervals.
+    This is particularly effective for fire perimeters as it captures shape
+    information while being robust to polygon complexity.
+    """
+    try:
+        centroid = polygon.centroid
+        angles = np.linspace(0, 2*np.pi, n_radial, endpoint=False)
+        
+        distances = []
+        for angle in angles:
+            # Cast ray from centroid at this angle
+            ray_length = 1000  # Large number to ensure intersection with boundary
+            ray_end_x = centroid.x + ray_length * np.cos(angle)
+            ray_end_y = centroid.y + ray_length * np.sin(angle)
+            ray = LineString([(centroid.x, centroid.y), (ray_end_x, ray_end_y)])
+            
+            try:
+                # Find intersection with polygon boundary
+                intersection = polygon.boundary.intersection(ray)
+                if intersection.is_empty:
+                    distances.append(0.0)
+                else:
+                    if hasattr(intersection, 'geoms'):
+                        # Multiple intersections, take the farthest from centroid
+                        max_dist = max(centroid.distance(geom) for geom in intersection.geoms 
+                                     if hasattr(geom, 'coords'))
+                    else:
+                        max_dist = centroid.distance(intersection)
+                    distances.append(max_dist)
+            except Exception:
+                distances.append(0.0)
+        
+        # Return [centroid_x, centroid_y, distance_0, distance_1, ...]
+        return np.array([centroid.x, centroid.y] + distances)
+    
+    except Exception as e:
+        # Fallback: return zeros with correct shape
+        print(f"Warning: Failed to parameterize polygon - {e}")
+        return np.zeros(n_radial + 2)
+
+
+def _polygon_to_coordinate_features(polygon, n_coords=20):
+    """
+    Convert polygon to fixed number of coordinate pairs.
+    
+    This method samples n_coords coordinate pairs from the polygon boundary,
+    either by downsampling (if polygon has more points) or upsampling 
+    (if polygon has fewer points) using linear interpolation.
+    """
+    try:
+        # Get exterior coordinates (remove duplicate last point)
+        coords = list(polygon.exterior.coords)[:-1]
+        
+        if len(coords) == 0:
+            # Empty polygon
+            return np.zeros(n_coords * 2)
+        
+        # Resample to fixed number of points
+        if len(coords) > n_coords:
+            # Downsample by selecting evenly spaced points
+            indices = np.linspace(0, len(coords)-1, n_coords, dtype=int)
+            coords = [coords[i] for i in indices]
+        elif len(coords) < n_coords:
+            # Upsample by linear interpolation
+            coords = np.array(coords)
+            indices = np.linspace(0, len(coords)-1, n_coords)
+            coords_interp = []
+            for idx in indices:
+                i = int(idx)
+                if i >= len(coords) - 1:
+                    coords_interp.append(coords[-1])
+                else:
+                    # Linear interpolation between coords[i] and coords[i+1]
+                    t = idx - i
+                    x = coords[i][0] * (1-t) + coords[i+1][0] * t
+                    y = coords[i][1] * (1-t) + coords[i+1][1] * t
+                    coords_interp.append((x, y))
+            coords = coords_interp
+        
+        # Flatten coordinate pairs into single array
+        return np.array(coords).flatten()
+    
+    except Exception as e:
+        # Fallback: return zeros with correct shape
+        print(f"Warning: Failed to parameterize polygon coordinates - {e}")
+        return np.zeros(n_coords * 2)
+
+
+def features_to_polygon(features, method='radial', n_params=36):
+    """
+    Convert feature vector back to shapely Polygon.
+    
+    This is the inverse operation of translate_multipolygon_for_ml, converting
+    a numerical feature vector back into a polygon geometry.
+    
+    Parameters:
+    -----------
+    features : np.ndarray
+        Feature vector from translate_multipolygon_for_ml
+    method : str
+        The parameterization method used ('radial' or 'coordinates')
+    n_params : int
+        Number of parameters used in original parameterization
+    
+    Returns:
+    --------
+    shapely.geometry.polygon.Polygon
+        Reconstructed polygon from features
+    """
+    if method == 'radial':
+        return _radial_features_to_polygon(features)
+    elif method == 'coordinates':
+        return _coordinate_features_to_polygon(features)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+
+def _radial_features_to_polygon(features):
+    """Convert radial representation back to polygon"""
+    try:
+        centroid_x, centroid_y = features[0], features[1]
+        distances = features[2:]
+        angles = np.linspace(0, 2*np.pi, len(distances), endpoint=False)
+        
+        # Calculate boundary points
+        boundary_points = []
+        for angle, distance in zip(angles, distances):
+            if distance > 0:
+                x = centroid_x + distance * np.cos(angle)
+                y = centroid_y + distance * np.sin(angle)
+                boundary_points.append((x, y))
+        
+        if len(boundary_points) < 3:
+            # Fallback to small circle around centroid
+            circle_radius = 0.001
+            angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+            boundary_points = [
+                (centroid_x + circle_radius * np.cos(a), 
+                 centroid_y + circle_radius * np.sin(a))
+                for a in angles
+            ]
+        
+        return Polygon(boundary_points)
+    
+    except Exception:
+        # Fallback polygon
+        centroid_x, centroid_y = features[0], features[1]
+        return Polygon([(centroid_x-0.001, centroid_y-0.001),
+                       (centroid_x+0.001, centroid_y-0.001),
+                       (centroid_x+0.001, centroid_y+0.001),
+                       (centroid_x-0.001, centroid_y+0.001)])
+
+
+def _coordinate_features_to_polygon(features):
+    """Convert coordinate array back to polygon"""
+    try:
+        coords = features.reshape(-1, 2)
+        return Polygon(coords)
+    except Exception:
+        # Fallback if invalid polygon
+        centroid = coords.mean(axis=0) if len(coords) > 0 else np.array([0, 0])
+        return Polygon([(centroid[0]-0.001, centroid[1]-0.001),
+                       (centroid[0]+0.001, centroid[1]-0.001),
+                       (centroid[0]+0.001, centroid[1]+0.001),
+                       (centroid[0]-0.001, centroid[1]+0.001)])
+
+
+def demonstrate_multipolygon_translation():
+    """
+    Demonstrate the MultiPolygon translation functionality with examples.
+    
+    This function shows how to use the translation functions with various
+    polygon types and validates the round-trip conversion (polygon -> features -> polygon).
+    """
+    print("Demonstrating MultiPolygon Translation for ML")
+    print("=" * 50)
+    
+    # Create sample polygons
+    square = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+    triangle = Polygon([(2, 2), (3, 2), (2.5, 3)])
+    multi_poly = MultiPolygon([square, triangle])
+    
+    # Test radial parameterization
+    print("\n1. Radial Parameterization:")
+    features_radial = translate_multipolygon_for_ml(multi_poly, method='radial', n_params=12)
+    print(f"   Original: MultiPolygon with {len(multi_poly.geoms)} components")
+    print(f"   Features shape: {features_radial.shape}")
+    print(f"   Centroid: ({features_radial[0]:.3f}, {features_radial[1]:.3f})")
+    print(f"   Sample distances: {features_radial[2:6]}")
+    
+    # Reconstruct polygon
+    reconstructed = features_to_polygon(features_radial, method='radial')
+    print(f"   Reconstructed area: {reconstructed.area:.6f}")
+    print(f"   Original largest area: {max(p.area for p in multi_poly.geoms):.6f}")
+    
+    # Test coordinate parameterization
+    print("\n2. Coordinate Parameterization:")
+    features_coords = translate_multipolygon_for_ml(square, method='coordinates', n_params=8)
+    print(f"   Features shape: {features_coords.shape}")
+    print(f"   Sample coordinates: {features_coords[:6]}")
+    
+    # Reconstruct polygon
+    reconstructed_coords = features_to_polygon(features_coords, method='coordinates')
+    print(f"   Reconstructed area: {reconstructed_coords.area:.6f}")
+    print(f"   Original area: {square.area:.6f}")
+    
+    # Test with fire-like irregular shape
+    print("\n3. Fire-like Irregular Shape:")
+    import math
+    
+    # Create an irregular "fire-like" shape
+    angles = np.linspace(0, 2*np.pi, 20, endpoint=False)
+    # Vary radius to create irregular boundary
+    radii = [1 + 0.3*math.sin(3*a) + 0.2*np.random.random() for a in angles]
+    fire_coords = [(r*np.cos(a), r*np.sin(a)) for a, r in zip(angles, radii)]
+    fire_poly = Polygon(fire_coords)
+    
+    fire_features = translate_multipolygon_for_ml(fire_poly, method='radial', n_params=36)
+    print(f"   Fire polygon area: {fire_poly.area:.6f}")
+    print(f"   Features shape: {fire_features.shape}")
+    
+    fire_reconstructed = features_to_polygon(fire_features, method='radial')
+    print(f"   Reconstructed area: {fire_reconstructed.area:.6f}")
+    print(f"   Area preservation: {fire_reconstructed.area/fire_poly.area:.3f}")
+    
+    print("\nTranslation demonstration complete!")
+    
+    return {
+        'original_multi': multi_poly,
+        'radial_features': features_radial,
+        'coordinate_features': features_coords,
+        'fire_polygon': fire_poly,
+        'fire_features': fire_features
+    }
+
+
+# Add compatibility function for existing fire datasets
+def extract_polygon_features_from_fire_dataset(fire_dataset, method='radial', n_params=36):
+    """
+    Extract polygon features from a FireDataset for use in machine learning models.
+    
+    This function processes all daily fire perimeters in a FireDataset and converts
+    them to numerical features suitable for ML training.
+    
+    Parameters:
+    -----------
+    fire_dataset : FireDataset
+        A FireDataset object containing daily fire data
+    method : str
+        Parameterization method ('radial' or 'coordinates')
+    n_params : int
+        Number of parameters for parameterization
+    
+    Returns:
+    --------
+    list of np.ndarray
+        List of feature vectors, one for each day with perimeter data
+    list of date
+        Corresponding dates for each feature vector
+    """
+    features_list = []
+    dates_list = []
+    
+    for day_data in fire_dataset.daily_data:
+        if day_data.daily_perimeter is not None:
+            try:
+                features = translate_multipolygon_for_ml(
+                    day_data.daily_perimeter, 
+                    method=method, 
+                    n_params=n_params
+                )
+                features_list.append(features)
+                dates_list.append(day_data.date)
+            except Exception as e:
+                print(f"Warning: Failed to extract features for {day_data.date}: {e}")
+    
+    return features_list, dates_list
