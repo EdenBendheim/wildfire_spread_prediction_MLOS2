@@ -56,16 +56,38 @@ class DayGroundData:
     air_humidity: List[float]              # Qair_f_tavg
     soil_moisture: List[float]             # SoilMoi00_10cm_tavg
     soil_temp: List[float]                 # SoilTemp00_10cm_tavg
-    
+    burn_decay: List[float] = field(default_factory=list) # New field for burn decay
+
     def __post_init__(self):
-        """Validate that all data lists have the same length"""
-        lengths = [
-            len(self.coordinates), len(self.avg_surf_temp), len(self.rainfall),
-            len(self.vegetation_transpiration), len(self.wind_speed), len(self.air_temp),
-            len(self.air_humidity), len(self.soil_moisture), len(self.soil_temp)
-        ]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"All data lists must have same length. Got: {lengths}")
+        """Validate that all data lists have the same length as coordinates if coordinates exist."""
+        if self.coordinates: # If there are coordinates, all other lists must match its length
+            expected_len = len(self.coordinates)
+            data_lists_to_check = [
+                self.avg_surf_temp, self.rainfall, self.vegetation_transpiration,
+                self.wind_speed, self.air_temp, self.air_humidity,
+                self.soil_moisture, self.soil_temp, self.burn_decay
+            ]
+            list_names = [ # Corresponding names for error messages
+                "avg_surf_temp", "rainfall", "vegetation_transpiration",
+                "wind_speed", "air_temp", "air_humidity",
+                "soil_moisture", "soil_temp", "burn_decay"
+            ]
+            for i, data_list in enumerate(data_lists_to_check):
+                if len(data_list) != expected_len:
+                    raise ValueError(
+                        f"Data list '{list_names[i]}' length ({len(data_list)}) "
+                        f"does not match coordinates length ({expected_len}) for date {self.date}, fire {self.fire_id}."
+                    )
+        else: # If there are no coordinates, all other lists must also be empty
+            all_other_lists = [
+                self.avg_surf_temp, self.rainfall, self.vegetation_transpiration,
+                self.wind_speed, self.air_temp, self.air_humidity,
+                self.soil_moisture, self.soil_temp, self.burn_decay
+            ]
+            if any(len(lst) > 0 for lst in all_other_lists):
+                raise ValueError(
+                    f"Coordinates list is empty, but some other data lists are not. All should be empty for date {self.date}, fire {self.fire_id}."
+                )
     
     @property
     def num_points(self) -> int:
@@ -82,7 +104,8 @@ class DayGroundData:
             'air_temp': self.air_temp,
             'air_humidity': self.air_humidity,
             'soil_moisture': self.soil_moisture,
-            'soil_temp': self.soil_temp
+            'soil_temp': self.soil_temp,
+            'burn_decay': self.burn_decay # Added burn_decay
         }
         
         stats = {}
@@ -218,69 +241,111 @@ class FireDataCompiler:
             raise ValueError("Data not loaded. Call load_data() first.")
             
         # Get perimeter data for this fire
-        fire_perimeters = self.perimeter_data[self.perimeter_data['fireID'] == fire_id].copy()
-        fire_ground = self.ground_data[self.ground_data['fireID'] == fire_id].copy()
+        fire_perimeters_df = self.perimeter_data[self.perimeter_data['fireID'] == fire_id].copy()
+        fire_ground_df = self.ground_data[self.ground_data['fireID'] == fire_id].copy()
         
-        if fire_perimeters.empty:
+        if fire_perimeters_df.empty:
             print(f"Warning: No perimeter data found for fire {fire_id}")
-            return None
+            return None # Cannot calculate burn decay without perimeters
             
         # Sort by date
-        fire_perimeters = fire_perimeters.sort_values('date')
-        fire_ground = fire_ground.sort_values('date')
+        fire_perimeters_df = fire_perimeters_df.sort_values('date')
+        fire_ground_df = fire_ground_df.sort_values('date')
         
         # Get all unique dates for this fire
-        all_dates = sorted(set(fire_perimeters['date'].unique()) | set(fire_ground['date'].unique()))
+        all_dates = sorted(list(set(fire_perimeters_df['date'].unique()) | set(fire_ground_df['date'].unique())))
         
-        daily_data = []
-        cumulative_perimeters = []
+        daily_data_list = []
+        
+        # Tracks consecutive days a ground point has been in the fire.
+        # Key: (lat, lon) tuple for ground data point. Value: integer count of consecutive days.
+        point_burn_streaks: Dict[Tuple[float, float], int] = {}
+
+        # This list will store the actual Polygon/MultiPolygon objects that define the fire boundary each day.
+        # It accumulates *new* perimeters as they appear.
+        active_perimeters_so_far: List[Polygon] = [] 
         
         for current_date in all_dates:
-            # Get perimeter for this specific date
-            daily_perimeter_data = fire_perimeters[fire_perimeters['date'] == current_date]
-            daily_perimeter = None
+            # Get *new* perimeter for this specific date from fire_perimeters_df
+            daily_perimeter_geom_data = fire_perimeters_df[fire_perimeters_df['date'] == current_date]
+            new_perimeter_for_today = None
             
-            if not daily_perimeter_data.empty:
-                # Add this day's perimeter to cumulative list
-                geom = daily_perimeter_data.iloc[0]['geometry']
-                if isinstance(geom, (Polygon, MultiPolygon)):
-                    cumulative_perimeters.append(geom)
-                    daily_perimeter = geom
+            if not daily_perimeter_geom_data.empty:
+                geom = daily_perimeter_geom_data.iloc[0]['geometry']
+                # Ensure geom is a valid Polygon or MultiPolygon before adding
+                if isinstance(geom, (Polygon, MultiPolygon)) and not geom.is_empty and geom.is_valid:
+                    active_perimeters_so_far.append(geom)
+                    new_perimeter_for_today = geom 
             
-            # Get ground data for this date
-            daily_ground_data = fire_ground[fire_ground['date'] == current_date]
+            current_day_cumulative_perimeters_list = active_perimeters_so_far.copy()
+
+            current_total_fire_polygon = None
+            if current_day_cumulative_perimeters_list:
+                try:
+                    # Filter out any invalid or empty geometries before union
+                    valid_geoms = [g for g in current_day_cumulative_perimeters_list if g.is_valid and not g.is_empty]
+                    if valid_geoms:
+                        current_total_fire_polygon = unary_union(valid_geoms)
+                        if current_total_fire_polygon.is_empty or not current_total_fire_polygon.is_valid:
+                            current_total_fire_polygon = None
+                    else: # No valid geoms to union
+                        current_total_fire_polygon = None
+                except Exception as e:
+                    print(f"Warning: Could not form unary_union for fire {fire_id} on {current_date}: {e}")
+                    current_total_fire_polygon = None
+            
+            daily_ground_records = fire_ground_df[fire_ground_df['date'] == current_date]
             ground_data_obj = None
             
-            if not daily_ground_data.empty:
-                # Extract ground data
-                coordinates = list(zip(daily_ground_data['lat'], daily_ground_data['lon']))
+            if not daily_ground_records.empty:
+                coordinates = list(zip(daily_ground_records['lat'], daily_ground_records['lon']))
+                burn_decay_values_for_current_day = []
+                
+                for coord_tuple in coordinates: # coord_tuple is (lat, lon)
+                    point_geom = Point(coord_tuple[1], coord_tuple[0]) # Shapely Point is (lon, lat)
+                    
+                    if current_total_fire_polygon and current_total_fire_polygon.contains(point_geom):
+                        point_burn_streaks[coord_tuple] = point_burn_streaks.get(coord_tuple, 0) + 1
+                        days_burning = point_burn_streaks[coord_tuple]
+                        # Decay formula: sum(0.8^i for i in 0 to days_burning-1)
+                        decay_value = sum(0.8**i for i in range(days_burning))
+                        burn_decay_values_for_current_day.append(decay_value)
+                    else:
+                        point_burn_streaks[coord_tuple] = 0 # Reset streak
+                        burn_decay_values_for_current_day.append(0.0)
                 
                 ground_data_obj = DayGroundData(
                     date=current_date,
                     fire_id=fire_id,
                     coordinates=coordinates,
-                    avg_surf_temp=daily_ground_data['AvgSurfT_tavg'].tolist(),
-                    rainfall=daily_ground_data['Rainf_tavg'].tolist(),
-                    vegetation_transpiration=daily_ground_data['TVeg_tavg'].tolist(),
-                    wind_speed=daily_ground_data['Wind_f_tavg'].tolist(),
-                    air_temp=daily_ground_data['Tair_f_tavg'].tolist(),
-                    air_humidity=daily_ground_data['Qair_f_tavg'].tolist(),
-                    soil_moisture=daily_ground_data['SoilMoi00_10cm_tavg'].tolist(),
-                    soil_temp=daily_ground_data['SoilTemp00_10cm_tavg'].tolist()
+                    avg_surf_temp=daily_ground_records['AvgSurfT_tavg'].tolist(),
+                    rainfall=daily_ground_records['Rainf_tavg'].tolist(),
+                    vegetation_transpiration=daily_ground_records['TVeg_tavg'].tolist(),
+                    wind_speed=daily_ground_records['Wind_f_tavg'].tolist(),
+                    air_temp=daily_ground_records['Tair_f_tavg'].tolist(),
+                    air_humidity=daily_ground_records['Qair_f_tavg'].tolist(),
+                    soil_moisture=daily_ground_records['SoilMoi00_10cm_tavg'].tolist(),
+                    soil_temp=daily_ground_records['SoilTemp00_10cm_tavg'].tolist(),
+                    burn_decay=burn_decay_values_for_current_day 
                 )
             
-            # Create day fire data with cumulative perimeters
-            day_fire_data = DayFireData(
+            day_fire_data_entry = DayFireData(
                 date=current_date,
                 fire_id=fire_id,
-                cumulative_perimeters=cumulative_perimeters.copy(),
-                daily_perimeter=daily_perimeter,
+                cumulative_perimeters=current_day_cumulative_perimeters_list,
+                daily_perimeter=new_perimeter_for_today,
                 ground_data=ground_data_obj
             )
-            
-            daily_data.append(day_fire_data)
+            daily_data_list.append(day_fire_data_entry)
         
-        return FireDataset(fire_id=fire_id, daily_data=daily_data)
+        if not daily_data_list and not fire_perimeters_df.empty :
+             print(f"Warning: No daily data compiled for fire {fire_id}, though perimeter data existed. Check date alignment or processing logic.")
+             return None
+        elif not daily_data_list and fire_perimeters_df.empty: # This case is handled at the start
+            pass
+
+
+        return FireDataset(fire_id=fire_id, daily_data=daily_data_list)
     
     def compile_all_fires(self, fire_ids: Optional[List[int]] = None) -> List[FireDataset]:
         """Compile data for all fires or a specific list of fire IDs"""
@@ -696,93 +761,90 @@ def visualize_fire_by_id(fire_id: int, interval_days: int = 5,
 
 
 def main():
-    # Load the data and get the fire perimeter for day 10 of fire 2623
+    fire_id_to_inspect = 2563
+    date_to_inspect_str = "2018-09-13"
+    target_date = datetime.strptime(date_to_inspect_str, "%Y-%m-%d").date()
+
+    print(f"--- Processing Fire {fire_id_to_inspect} for Burn Decay Analysis ---")
+    print(f"Target date for inspection: {target_date.strftime('%Y-%m-%d')}")
+
     compiler = FireDataCompiler()
-    compiler.load_data()
+    try:
+        print("Loading data...")
+        compiler.load_data()
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
 
-    # Compile the specific fire
-    fire_dataset = compiler.compile_fire_data(2623)
+    fire_dataset = None
+    print(f"Compiling data for fire {fire_id_to_inspect}...")
+    try:
+        fire_dataset = compiler.compile_fire_data(fire_id_to_inspect)
+    except Exception as e:
+        print(f"Critical error during compilation for fire {fire_id_to_inspect}: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
-    if fire_dataset and len(fire_dataset.daily_data) >= 10:
-        # Get day 10 (index 9 since it's 0-based)
-        day_10_data = fire_dataset.daily_data[9]
+    if fire_dataset and fire_dataset.daily_data:
+        print(f"Successfully compiled fire {fire_id_to_inspect}. Total days of data: {len(fire_dataset.daily_data)}")
         
-        # Get the perimeter polygon for day 10
-        day_10_perimeter = day_10_data.daily_perimeter
+        day_data_found = None
+        for day_data_entry in fire_dataset.daily_data:
+            if day_data_entry.date == target_date:
+                day_data_found = day_data_entry
+                break
         
-        if day_10_perimeter:
-            print(f"Fire 2623 Day 10 perimeter loaded successfully")
-            print(f"Date: {day_10_data.date}")
-            print(f"Perimeter type: {type(day_10_perimeter)}")
-            print(f"Perimeter area: {day_10_perimeter.area}")
-            print(f"Perimeter bounds: {day_10_perimeter.bounds}")
-            
-            # Demonstrate the new MultiPolygon translation functionality
-            print("\n" + "="*60)
-            print("DEMONSTRATING MULTIPOLYGON TRANSLATION FOR ML")
-            print("="*60)
-            
-            # Translate the perimeter to ML features using radial method
-            print("\n1. Converting polygon to ML features (radial method):")
-            features_radial = translate_multipolygon_for_ml(day_10_perimeter, method='radial', n_params=36)
-            print(f"   Original polygon area: {day_10_perimeter.area:.6f}")
-            print(f"   Features shape: {features_radial.shape}")
-            print(f"   Centroid: ({features_radial[0]:.6f}, {features_radial[1]:.6f})")
-            print(f"   Sample radial distances: {features_radial[2:8]}")
-            
-            # Convert back to polygon
-            reconstructed_poly = features_to_polygon(features_radial, method='radial', n_params=36)
-            print(f"   Reconstructed area: {reconstructed_poly.area:.6f}")
-            print(f"   Area preservation ratio: {reconstructed_poly.area/day_10_perimeter.area:.4f}")
-            
-            # Try coordinate method too
-            print("\n2. Converting polygon to ML features (coordinate method):")
-            features_coords = translate_multipolygon_for_ml(day_10_perimeter, method='coordinates', n_params=20)
-            print(f"   Features shape: {features_coords.shape}")
-            print(f"   Sample coordinates: {features_coords[:8]}")
-            
-            # Extract features from entire fire dataset
-            print("\n3. Extracting features from entire fire dataset:")
-            all_features, all_dates = extract_polygon_features_from_fire_dataset(
-                fire_dataset, method='radial', n_params=36
-            )
-            print(f"   Total days with polygon data: {len(all_features)}")
-            if all_features:
-                print(f"   Feature vector length: {len(all_features[0])}")
-                print(f"   Date range: {min(all_dates)} to {max(all_dates)}")
-                
-                # Show progression of fire size
-                areas_over_time = []
-                for i, (features, date) in enumerate(zip(all_features, all_dates)):
-                    reconstructed = features_to_polygon(features, method='radial')
-                    areas_over_time.append(reconstructed.area)
-                    if i < 5:  # Show first 5 days
-                        print(f"   Day {i+1} ({date}): area = {areas_over_time[i]:.6f}")
-                
-                print(f"   Maximum fire area: {max(areas_over_time):.6f}")
-                print(f"   Fire growth ratio: {max(areas_over_time)/areas_over_time[0]:.2f}x")
-            
-            print("\n" + "="*60)
-            print("MultiPolygon translation demonstration complete!")
-            print("Use translate_multipolygon_for_ml() to convert polygons to ML features")
-            print("Use features_to_polygon() to convert ML predictions back to polygons")
-            print("="*60)
+        if day_data_found:
+            print(f"\n--- Burn Decay Data for Fire {fire_id_to_inspect} on {target_date.strftime('%Y-%m-%d')} ---")
+            if day_data_found.ground_data:
+                ground_info = day_data_found.ground_data
+                if ground_info.coordinates and ground_info.burn_decay:
+                    print(f"Found {len(ground_info.coordinates)} ground data points for this day.")
+                    print("Coordinates (Lat, Lon) and their calculated Burn Decay Values:")
+                    non_zero_decay_count = 0
+                    for i in range(len(ground_info.coordinates)):
+                        coord = ground_info.coordinates[i] # (lat, lon)
+                        decay = ground_info.burn_decay[i]
+                        print(f"  Point {i+1:3d}: Lat={coord[0]:.4f}, Lon={coord[1]:.4f}, Burn Decay={decay:.4f}")
+                        if decay > 0:
+                            non_zero_decay_count +=1
+                    print(f"\nTotal points with non-zero burn decay: {non_zero_decay_count} out of {len(ground_info.coordinates)}")
+                    if non_zero_decay_count == 0 and len(ground_info.coordinates) > 0 :
+                         print("Note: All burn decay values are 0. This could mean:")
+                         print("  1. No ground points fell within the fire perimeter on this day or preceding days.")
+                         print("  2. There was an issue with perimeter data or the point-in-polygon check.")
+                         if day_data_found.cumulative_perimeters:
+                             try:
+                                 union_poly = unary_union(day_data_found.cumulative_perimeters)
+                                 if not union_poly.is_empty and union_poly.is_valid:
+                                     print(f"  Debug: Cumulative fire area for this day: {union_poly.area:.6f} sq. degrees. Bounds: {union_poly.bounds}")
+                                 else:
+                                     print("  Debug: Cumulative fire polygon for this day was empty or invalid.")
+                             except Exception as e_union:
+                                 print(f"  Debug: Could not get info on cumulative fire polygon: {e_union}")
+                         else:
+                             print("  Debug: No cumulative perimeters recorded for this day to check against.")
+
+                else:
+                    print("  No coordinate or burn decay data found within the ground data object for this day.")
+            else:
+                print("  No ground data object available for this day.")
         else:
-            print(f"No perimeter data found for day 10 of fire 2623")
-            # Check if cumulative perimeters are available
-            if day_10_data.cumulative_perimeters:
-                print(f"But cumulative perimeters available: {len(day_10_data.cumulative_perimeters)} polygons")
-    else:
-        print(f"Fire 2623 not found or has fewer than 10 days of data")
-        if fire_dataset:
-            print(f"Fire 2623 has {len(fire_dataset.daily_data)} days of data")
-        
-        # Still demonstrate the translation functionality with a simple example
-        print("\nDemonstrating MultiPolygon translation with simple example:")
-        demonstrate_multipolygon_translation()
+            print(f"  No data found for the specific date {target_date.strftime('%Y-%m-%d')} in fire {fire_id_to_inspect}.")
+            available_dates = sorted([d.date.strftime("%Y-%m-%d") for d in fire_dataset.daily_data])
+            if available_dates:
+                print(f"  Available dates for fire {fire_id_to_inspect} (first/last 5): {available_dates[:5]} ... {available_dates[-5:] if len(available_dates) > 10 else available_dates[5:]}")
+            else:
+                print(f"  No dates available in the compiled data for fire {fire_id_to_inspect}.")
 
 
+    elif fire_dataset is None: # compile_fire_data returned None
+         print(f"Failed to compile fire {fire_id_to_inspect}. This usually means no perimeter data was found for this fire ID.")
+    else: # fire_dataset exists but fire_dataset.daily_data is empty
+        print(f"Compiled fire {fire_id_to_inspect}, but it resulted in no daily data entries. Check data consistency.")
 
+    print(f"\n--- End of Processing for Fire {fire_id_to_inspect} ---")
 
 if __name__ == "__main__":
     main()
@@ -1035,73 +1097,7 @@ def _coordinate_features_to_polygon(features):
                        (centroid[0]-0.001, centroid[1]+0.001)])
 
 
-def demonstrate_multipolygon_translation():
-    """
-    Demonstrate the MultiPolygon translation functionality with examples.
-    
-    This function shows how to use the translation functions with various
-    polygon types and validates the round-trip conversion (polygon -> features -> polygon).
-    """
-    print("Demonstrating MultiPolygon Translation for ML")
-    print("=" * 50)
-    
-    # Create sample polygons
-    square = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
-    triangle = Polygon([(2, 2), (3, 2), (2.5, 3)])
-    multi_poly = MultiPolygon([square, triangle])
-    
-    # Test radial parameterization
-    print("\n1. Radial Parameterization:")
-    features_radial = translate_multipolygon_for_ml(multi_poly, method='radial', n_params=12)
-    print(f"   Original: MultiPolygon with {len(multi_poly.geoms)} components")
-    print(f"   Features shape: {features_radial.shape}")
-    print(f"   Centroid: ({features_radial[0]:.3f}, {features_radial[1]:.3f})")
-    print(f"   Sample distances: {features_radial[2:6]}")
-    
-    # Reconstruct polygon
-    reconstructed = features_to_polygon(features_radial, method='radial')
-    print(f"   Reconstructed area: {reconstructed.area:.6f}")
-    print(f"   Original largest area: {max(p.area for p in multi_poly.geoms):.6f}")
-    
-    # Test coordinate parameterization
-    print("\n2. Coordinate Parameterization:")
-    features_coords = translate_multipolygon_for_ml(square, method='coordinates', n_params=8)
-    print(f"   Features shape: {features_coords.shape}")
-    print(f"   Sample coordinates: {features_coords[:6]}")
-    
-    # Reconstruct polygon
-    reconstructed_coords = features_to_polygon(features_coords, method='coordinates')
-    print(f"   Reconstructed area: {reconstructed_coords.area:.6f}")
-    print(f"   Original area: {square.area:.6f}")
-    
-    # Test with fire-like irregular shape
-    print("\n3. Fire-like Irregular Shape:")
-    import math
-    
-    # Create an irregular "fire-like" shape
-    angles = np.linspace(0, 2*np.pi, 20, endpoint=False)
-    # Vary radius to create irregular boundary
-    radii = [1 + 0.3*math.sin(3*a) + 0.2*np.random.random() for a in angles]
-    fire_coords = [(r*np.cos(a), r*np.sin(a)) for a, r in zip(angles, radii)]
-    fire_poly = Polygon(fire_coords)
-    
-    fire_features = translate_multipolygon_for_ml(fire_poly, method='radial', n_params=36)
-    print(f"   Fire polygon area: {fire_poly.area:.6f}")
-    print(f"   Features shape: {fire_features.shape}")
-    
-    fire_reconstructed = features_to_polygon(fire_features, method='radial')
-    print(f"   Reconstructed area: {fire_reconstructed.area:.6f}")
-    print(f"   Area preservation: {fire_reconstructed.area/fire_poly.area:.3f}")
-    
-    print("\nTranslation demonstration complete!")
-    
-    return {
-        'original_multi': multi_poly,
-        'radial_features': features_radial,
-        'coordinate_features': features_coords,
-        'fire_polygon': fire_poly,
-        'fire_features': fire_features
-    }
+
 
 
 # Add compatibility function for existing fire datasets
