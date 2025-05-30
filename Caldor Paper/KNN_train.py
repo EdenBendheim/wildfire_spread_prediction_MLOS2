@@ -265,54 +265,101 @@ class FireDataCompiler:
         # It accumulates *new* perimeters as they appear.
         active_perimeters_so_far: List[Polygon] = [] 
         
+        # Pre-compute the unary union once per day and cache it
+        current_total_fire_polygon = None
+        
+        # Pre-create all ground points as a GeoDataFrame for reuse
+        all_ground_coords = {}
+        for current_date in all_dates:
+            daily_ground_records = fire_ground_df[fire_ground_df['date'] == current_date]
+            if not daily_ground_records.empty:
+                coords = list(zip(daily_ground_records['lat'], daily_ground_records['lon']))
+                all_ground_coords[current_date] = {
+                    'coords': coords,
+                    'records': daily_ground_records,
+                    'points_gdf': gpd.GeoDataFrame(
+                        geometry=[Point(lon, lat) for lat, lon in coords],
+                        crs='EPSG:4326'
+                    ) if coords else None
+                }
+        
         for current_date in all_dates:
             # Get *new* perimeter for this specific date from fire_perimeters_df
             daily_perimeter_geom_data = fire_perimeters_df[fire_perimeters_df['date'] == current_date]
             new_perimeter_for_today = None
             
+            polygon_updated = False
             if not daily_perimeter_geom_data.empty:
                 geom = daily_perimeter_geom_data.iloc[0]['geometry']
                 # Ensure geom is a valid Polygon or MultiPolygon before adding
                 if isinstance(geom, (Polygon, MultiPolygon)) and not geom.is_empty and geom.is_valid:
                     active_perimeters_so_far.append(geom)
                     new_perimeter_for_today = geom 
+                    polygon_updated = True
+            
+            # Only recompute union if polygon was updated
+            if polygon_updated or current_total_fire_polygon is None:
+                current_day_cumulative_perimeters_list = active_perimeters_so_far.copy()
+                if current_day_cumulative_perimeters_list:
+                    try:
+                        # Filter out any invalid or empty geometries before union
+                        valid_geoms = [g for g in current_day_cumulative_perimeters_list if g.is_valid and not g.is_empty]
+                        if valid_geoms:
+                            current_total_fire_polygon = unary_union(valid_geoms)
+                            if current_total_fire_polygon.is_empty or not current_total_fire_polygon.is_valid:
+                                current_total_fire_polygon = None
+                        else: # No valid geoms to union
+                            current_total_fire_polygon = None
+                    except Exception as e:
+                        print(f"Warning: Could not form unary_union for fire {fire_id} on {current_date}: {e}")
+                        current_total_fire_polygon = None
             
             current_day_cumulative_perimeters_list = active_perimeters_so_far.copy()
-
-            current_total_fire_polygon = None
-            if current_day_cumulative_perimeters_list:
-                try:
-                    # Filter out any invalid or empty geometries before union
-                    valid_geoms = [g for g in current_day_cumulative_perimeters_list if g.is_valid and not g.is_empty]
-                    if valid_geoms:
-                        current_total_fire_polygon = unary_union(valid_geoms)
-                        if current_total_fire_polygon.is_empty or not current_total_fire_polygon.is_valid:
-                            current_total_fire_polygon = None
-                    else: # No valid geoms to union
-                        current_total_fire_polygon = None
-                except Exception as e:
-                    print(f"Warning: Could not form unary_union for fire {fire_id} on {current_date}: {e}")
-                    current_total_fire_polygon = None
-            
-            daily_ground_records = fire_ground_df[fire_ground_df['date'] == current_date]
             ground_data_obj = None
             
-            if not daily_ground_records.empty:
-                coordinates = list(zip(daily_ground_records['lat'], daily_ground_records['lon']))
-                burn_decay_values_for_current_day = []
+            # Process ground data if available for this date
+            if current_date in all_ground_coords:
+                ground_info = all_ground_coords[current_date]
+                coordinates = ground_info['coords']
+                daily_ground_records = ground_info['records']
+                points_gdf = ground_info['points_gdf']
                 
-                for coord_tuple in coordinates: # coord_tuple is (lat, lon)
-                    point_geom = Point(coord_tuple[1], coord_tuple[0]) # Shapely Point is (lon, lat)
+                # Fast point-in-polygon check using GeoPandas
+                if current_total_fire_polygon and points_gdf is not None and len(coordinates) > 0:
+                    try:
+                        # Create a temporary GeoDataFrame with the fire polygon
+                        fire_gdf = gpd.GeoDataFrame([1], geometry=[current_total_fire_polygon], crs='EPSG:4326')
+                        
+                        # Use spatial join for batch point-in-polygon
+                        joined = gpd.sjoin(points_gdf, fire_gdf, how='left', predicate='within')
+                        within_fire = ~joined['index_right'].isna()
+                        
+                    except Exception as e:
+                        print(f"Warning: Spatial join failed for {current_date}, falling back to individual checks: {e}")
+                        # Fallback to individual checks
+                        within_fire = points_gdf.geometry.apply(lambda pt: current_total_fire_polygon.contains(pt))
                     
-                    if current_total_fire_polygon and current_total_fire_polygon.contains(point_geom):
-                        point_burn_streaks[coord_tuple] = point_burn_streaks.get(coord_tuple, 0) + 1
-                        days_burning = point_burn_streaks[coord_tuple]
-                        # Decay formula: sum(0.8^i for i in 0 to days_burning-1)
-                        decay_value = sum(0.8**i for i in range(days_burning))
-                        burn_decay_values_for_current_day.append(decay_value)
-                    else:
-                        point_burn_streaks[coord_tuple] = 0 # Reset streak
-                        burn_decay_values_for_current_day.append(0.0)
+                    burn_decay_values_for_current_day = []
+                    for i, (coord_tuple, is_within) in enumerate(zip(coordinates, within_fire)):
+                        if is_within:
+                            point_burn_streaks[coord_tuple] = point_burn_streaks.get(coord_tuple, 0) + 1
+                            days_burning = point_burn_streaks[coord_tuple]
+                            # Pre-computed decay formula for efficiency
+                            if days_burning <= 10:  # Cache first 10 values
+                                decay_value = sum(0.8**i for i in range(days_burning))
+                            else:
+                                # Use geometric series formula for large values: sum = (1 - r^n) / (1 - r)
+                                decay_value = (1 - 0.8**days_burning) / (1 - 0.8)
+                            burn_decay_values_for_current_day.append(decay_value)
+                        else:
+                            point_burn_streaks[coord_tuple] = 0 # Reset streak
+                            burn_decay_values_for_current_day.append(0.0)
+                else:
+                    # No fire polygon or no coordinates
+                    burn_decay_values_for_current_day = [0.0] * len(coordinates)
+                    # Reset all streaks
+                    for coord_tuple in coordinates:
+                        point_burn_streaks[coord_tuple] = 0
                 
                 ground_data_obj = DayGroundData(
                     date=current_date,
@@ -348,7 +395,7 @@ class FireDataCompiler:
         return FireDataset(fire_id=fire_id, daily_data=daily_data_list)
     
     def compile_all_fires(self, fire_ids: Optional[List[int]] = None) -> List[FireDataset]:
-        """Compile data for all fires or a specific list of fire IDs"""
+        """Optimized compile data for all fires using vectorized operations"""
         if self.perimeter_data is None or self.ground_data is None:
             raise ValueError("Data not loaded. Call load_data() first.")
             
@@ -359,30 +406,172 @@ class FireDataCompiler:
             fire_ids = sorted(perimeter_fire_ids & ground_fire_ids)
             print(f"Found {len(fire_ids)} fires with both perimeter and ground data")
         
+        # Pre-process all ground data into spatial structure once
+        print("Pre-processing ground data...")
+        ground_gdf = gpd.GeoDataFrame(
+            self.ground_data,
+            geometry=gpd.points_from_xy(self.ground_data['lon'], self.ground_data['lat']),
+            crs='EPSG:4326'
+        )
+        
+        # Group ground data by fire_id and date for efficient lookup
+        ground_grouped = ground_gdf.groupby(['fireID', 'date'])
+        ground_lookup = {}
+        for (fire_id, date), group in ground_grouped:
+            ground_lookup[(fire_id, date)] = group
+        
+        # Group perimeter data by fire_id and date
+        perimeter_grouped = self.perimeter_data.groupby(['fireID', 'date'])
+        perimeter_lookup = {}
+        for (fire_id, date), group in perimeter_grouped:
+            if not group.empty:
+                geom = group.iloc[0]['geometry']
+                if isinstance(geom, (Polygon, MultiPolygon)) and not geom.is_empty and geom.is_valid:
+                    perimeter_lookup[(fire_id, date)] = geom
+        
         compiled_fires = []
         failed_fires = []
         
-        for i, fire_id in enumerate(fire_ids):
-            try:
-                print(f"Processing fire {fire_id} ({i+1}/{len(fire_ids)})...")
-                fire_dataset = self.compile_fire_data(fire_id)
-                if fire_dataset:
-                    compiled_fires.append(fire_dataset)
-                    print(f"  ✓ Fire {fire_id}: {fire_dataset.duration_days} days, max area: {fire_dataset.max_area:.6f}")
-                else:
+        # Process fires in batches for memory efficiency
+        batch_size = 100
+        for batch_start in range(0, len(fire_ids), batch_size):
+            batch_fire_ids = fire_ids[batch_start:batch_start + batch_size]
+            print(f"Processing batch {batch_start//batch_size + 1}/{(len(fire_ids)-1)//batch_size + 1}: fires {batch_start+1}-{min(batch_start+batch_size, len(fire_ids))}")
+            
+            for fire_id in batch_fire_ids:
+                try:
+                    fire_dataset = self._compile_fire_data_vectorized(fire_id, perimeter_lookup, ground_lookup)
+                    if fire_dataset and fire_dataset.daily_data:
+                        compiled_fires.append(fire_dataset)
+                    else:
+                        failed_fires.append(fire_id)
+                except Exception as e:
                     failed_fires.append(fire_id)
-                    print(f"  ✗ Fire {fire_id}: Failed to compile")
-            except Exception as e:
-                failed_fires.append(fire_id)
-                print(f"  ✗ Fire {fire_id}: Error - {e}")
+                    print(f"  ✗ Fire {fire_id}: Error - {e}")
         
-        print(f"\nCompilation complete:")
-        print(f"  Successfully compiled: {len(compiled_fires)} fires")
-        print(f"  Failed: {len(failed_fires)} fires")
-        if failed_fires:
-            print(f"  Failed fire IDs: {failed_fires[:10]}{'...' if len(failed_fires) > 10 else ''}")
-        
+        print(f"\nCompilation complete: {len(compiled_fires)} success, {len(failed_fires)} failed")
         return compiled_fires
+    
+    def _compile_fire_data_vectorized(self, fire_id: int, perimeter_lookup: dict, ground_lookup: dict) -> Optional[FireDataset]:
+        """Vectorized version using pre-processed lookup tables"""
+        
+        # Get all dates for this fire from both datasets
+        perimeter_dates = [date for (fid, date) in perimeter_lookup.keys() if fid == fire_id]
+        ground_dates = [date for (fid, date) in ground_lookup.keys() if fid == fire_id]
+        all_dates = sorted(set(perimeter_dates + ground_dates))
+        
+        if not all_dates:
+            return None
+        
+        # Pre-compute cumulative fire polygons
+        cumulative_polygons = []
+        perimeter_by_date = {}
+        cumulative_union = None
+        
+        for current_date in all_dates:
+            new_perimeter = perimeter_lookup.get((fire_id, current_date))
+            
+            if new_perimeter is not None:
+                cumulative_polygons.append(new_perimeter)
+                # Efficiently update cumulative union
+                if cumulative_union is None:
+                    cumulative_union = new_perimeter
+                else:
+                    try:
+                        cumulative_union = cumulative_union.union(new_perimeter)
+                    except Exception:
+                        cumulative_union = unary_union(cumulative_polygons)
+            
+            perimeter_by_date[current_date] = {
+                'new_perimeter': new_perimeter,
+                'cumulative_polygons': cumulative_polygons.copy(),
+                'cumulative_union': cumulative_union
+            }
+        
+        # Pre-compute burn decay using vectorized operations
+        point_burn_streaks = {}
+        daily_data_list = []
+        
+        for current_date in all_dates:
+            perimeter_info = perimeter_by_date[current_date]
+            ground_group = ground_lookup.get((fire_id, current_date))
+            
+            ground_data_obj = None
+            if ground_group is not None and not ground_group.empty:
+                # Vectorized coordinate extraction
+                coordinates = list(zip(ground_group['lat'], ground_group['lon']))
+                
+                # Vectorized point-in-polygon check
+                if perimeter_info['cumulative_union'] and len(coordinates) > 0:
+                    # Use spatial join for batch processing
+                    fire_poly_gdf = gpd.GeoDataFrame([1], geometry=[perimeter_info['cumulative_union']], crs='EPSG:4326')
+                    joined = gpd.sjoin(ground_group, fire_poly_gdf, how='left', predicate='within')
+                    within_fire = ~joined['index_right'].isna().values
+                    
+                    # Vectorized burn decay calculation
+                    burn_decay_values = self._calculate_burn_decay_vectorized(
+                        coordinates, within_fire, point_burn_streaks
+                    )
+                else:
+                    burn_decay_values = np.zeros(len(coordinates))
+                    # Reset all streaks
+                    for coord_tuple in coordinates:
+                        point_burn_streaks[coord_tuple] = 0
+                
+                # Vectorized data extraction
+                ground_data_obj = DayGroundData(
+                    date=current_date,
+                    fire_id=fire_id,
+                    coordinates=coordinates,
+                    avg_surf_temp=ground_group['AvgSurfT_tavg'].values.tolist(),
+                    rainfall=ground_group['Rainf_tavg'].values.tolist(),
+                    vegetation_transpiration=ground_group['TVeg_tavg'].values.tolist(),
+                    wind_speed=ground_group['Wind_f_tavg'].values.tolist(),
+                    air_temp=ground_group['Tair_f_tavg'].values.tolist(),
+                    air_humidity=ground_group['Qair_f_tavg'].values.tolist(),
+                    soil_moisture=ground_group['SoilMoi00_10cm_tavg'].values.tolist(),
+                    soil_temp=ground_group['SoilTemp00_10cm_tavg'].values.tolist(),
+                    burn_decay=burn_decay_values.tolist()
+                )
+            
+            day_fire_data = DayFireData(
+                date=current_date,
+                fire_id=fire_id,
+                cumulative_perimeters=perimeter_info['cumulative_polygons'],
+                daily_perimeter=perimeter_info['new_perimeter'],
+                ground_data=ground_data_obj
+            )
+            daily_data_list.append(day_fire_data)
+        
+        return FireDataset(fire_id=fire_id, daily_data=daily_data_list)
+    
+    def _calculate_burn_decay_vectorized(self, coordinates: List[Tuple[float, float]], 
+                                       within_fire: np.ndarray, 
+                                       point_burn_streaks: Dict[Tuple[float, float], int]) -> np.ndarray:
+        """Vectorized burn decay calculation using numpy"""
+        n_points = len(coordinates)
+        burn_decay_values = np.zeros(n_points, dtype=np.float64)
+        
+        # Pre-compute geometric series values for common streak lengths (up to 50 days)
+        max_precompute = 50
+        decay_lookup = np.array([sum(0.8**i for i in range(days)) for days in range(max_precompute + 1)])
+        
+        for i, (coord_tuple, is_within) in enumerate(zip(coordinates, within_fire)):
+            if is_within:
+                point_burn_streaks[coord_tuple] = point_burn_streaks.get(coord_tuple, 0) + 1
+                days_burning = point_burn_streaks[coord_tuple]
+                
+                # Use pre-computed values for common cases, formula for longer streaks
+                if days_burning <= max_precompute:
+                    burn_decay_values[i] = decay_lookup[days_burning]
+                else:
+                    # Geometric series formula: (1 - r^n) / (1 - r)
+                    burn_decay_values[i] = (1 - 0.8**days_burning) / 0.2
+            else:
+                point_burn_streaks[coord_tuple] = 0
+                burn_decay_values[i] = 0.0
+        
+        return burn_decay_values
     
     def save_compiled_data(self, compiled_fires: List[FireDataset], filename: str = "compiled_fire_data.pkl"):
         """Save compiled fire data to a pickle file"""
@@ -777,74 +966,28 @@ def main():
         return
 
     fire_dataset = None
-    print(f"Compiling data for fire {fire_id_to_inspect}...")
-    try:
-        fire_dataset = compiler.compile_fire_data(fire_id_to_inspect)
-    except Exception as e:
-        print(f"Critical error during compilation for fire {fire_id_to_inspect}: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+    
+    # Complie all fires in the dataset
+    compiled_fires = compiler.compile_all_fires()
 
-    if fire_dataset and fire_dataset.daily_data:
-        print(f"Successfully compiled fire {fire_id_to_inspect}. Total days of data: {len(fire_dataset.daily_data)}")
-        
-        day_data_found = None
-        for day_data_entry in fire_dataset.daily_data:
-            if day_data_entry.date == target_date:
-                day_data_found = day_data_entry
-                break
-        
-        if day_data_found:
-            print(f"\n--- Burn Decay Data for Fire {fire_id_to_inspect} on {target_date.strftime('%Y-%m-%d')} ---")
-            if day_data_found.ground_data:
-                ground_info = day_data_found.ground_data
-                if ground_info.coordinates and ground_info.burn_decay:
-                    print(f"Found {len(ground_info.coordinates)} ground data points for this day.")
-                    print("Coordinates (Lat, Lon) and their calculated Burn Decay Values:")
-                    non_zero_decay_count = 0
-                    for i in range(len(ground_info.coordinates)):
-                        coord = ground_info.coordinates[i] # (lat, lon)
-                        decay = ground_info.burn_decay[i]
-                        print(f"  Point {i+1:3d}: Lat={coord[0]:.4f}, Lon={coord[1]:.4f}, Burn Decay={decay:.4f}")
-                        if decay > 0:
-                            non_zero_decay_count +=1
-                    print(f"\nTotal points with non-zero burn decay: {non_zero_decay_count} out of {len(ground_info.coordinates)}")
-                    if non_zero_decay_count == 0 and len(ground_info.coordinates) > 0 :
-                         print("Note: All burn decay values are 0. This could mean:")
-                         print("  1. No ground points fell within the fire perimeter on this day or preceding days.")
-                         print("  2. There was an issue with perimeter data or the point-in-polygon check.")
-                         if day_data_found.cumulative_perimeters:
-                             try:
-                                 union_poly = unary_union(day_data_found.cumulative_perimeters)
-                                 if not union_poly.is_empty and union_poly.is_valid:
-                                     print(f"  Debug: Cumulative fire area for this day: {union_poly.area:.6f} sq. degrees. Bounds: {union_poly.bounds}")
-                                 else:
-                                     print("  Debug: Cumulative fire polygon for this day was empty or invalid.")
-                             except Exception as e_union:
-                                 print(f"  Debug: Could not get info on cumulative fire polygon: {e_union}")
-                         else:
-                             print("  Debug: No cumulative perimeters recorded for this day to check against.")
+    # Split the fires into training and testing sets
+    train_fires, test_fires = train_test_split(compiled_fires, test_size=0.2, random_state=42)
+    X_train = []
+    y_train = []
 
-                else:
-                    print("  No coordinate or burn decay data found within the ground data object for this day.")
-            else:
-                print("  No ground data object available for this day.")
-        else:
-            print(f"  No data found for the specific date {target_date.strftime('%Y-%m-%d')} in fire {fire_id_to_inspect}.")
-            available_dates = sorted([d.date.strftime("%Y-%m-%d") for d in fire_dataset.daily_data])
-            if available_dates:
-                print(f"  Available dates for fire {fire_id_to_inspect} (first/last 5): {available_dates[:5]} ... {available_dates[-5:] if len(available_dates) > 10 else available_dates[5:]}")
-            else:
-                print(f"  No dates available in the compiled data for fire {fire_id_to_inspect}.")
+    for fire in train_fires:
+        for day_data in fire.daily_data:
+            X_train_day = []
+            for ground_data in day_data.ground_data:
+                X_train_day.append(ground_data.burn_decay)
+                X_train_day.append(ground_data.avg_surf_temp)
+                X_train_day.append(ground_data.rainfall)
+                X_train_day.append(ground_data.vegetation_transpiration)
+                X_train_day
 
+    print(f"Total fires compiled: {len(compiled_fires)}")
 
-    elif fire_dataset is None: # compile_fire_data returned None
-         print(f"Failed to compile fire {fire_id_to_inspect}. This usually means no perimeter data was found for this fire ID.")
-    else: # fire_dataset exists but fire_dataset.daily_data is empty
-        print(f"Compiled fire {fire_id_to_inspect}, but it resulted in no daily data entries. Check data consistency.")
-
-    print(f"\n--- End of Processing for Fire {fire_id_to_inspect} ---")
+    
 
 if __name__ == "__main__":
     main()
@@ -1095,8 +1238,6 @@ def _coordinate_features_to_polygon(features):
                        (centroid[0]+0.001, centroid[1]-0.001),
                        (centroid[0]+0.001, centroid[1]+0.001),
                        (centroid[0]-0.001, centroid[1]+0.001)])
-
-
 
 
 
