@@ -33,9 +33,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from shapely.ops import unary_union
 from shapely.affinity import translate, scale
 from shapely.geometry import LineString, Point
+from scipy.spatial import KDTree
+from multiprocessing import Pool, cpu_count
+from functools import partial
 import random
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -949,43 +954,611 @@ def visualize_fire_by_id(fire_id: int, interval_days: int = 5,
         return None
 
 
+def extract_spatial_grid_features_batched(fires: List[FireDataset], grid_size: int = 9, 
+                                         batch_size: int = 10, use_parallel: bool = True,
+                                         n_jobs: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Memory-efficient batch processing for fire spread prediction feature extraction.
+    Only considers points with burn_decay=0 in current day to predict fire spread.
+    
+    Parameters:
+    -----------
+    fires : List[FireDataset]
+        List of compiled fire datasets
+    grid_size : int
+        Size of the spatial grid (default: 9 for 9x9)
+    batch_size : int
+        Number of fires to process at once (default: 10)
+    use_parallel : bool
+        Whether to use parallel processing (default: True)
+    n_jobs : int
+        Number of parallel jobs (default: number of CPU cores)
+    
+    Returns:
+    --------
+    X : np.ndarray
+        Feature matrix (9x9 grids with 8 variables = 648 features per point)
+    y : np.ndarray
+        Binary target vector (1 = fire spread occurred, 0 = no spread)
+    """
+    print(f"Processing {len(fires)} fires in batches of {batch_size}")
+    
+    all_features = []
+    all_targets = []
+    total_points = 0
+    
+    for batch_start in range(0, len(fires), batch_size):
+        batch_end = min(batch_start + batch_size, len(fires))
+        batch_fires = fires[batch_start:batch_end]
+        
+        print(f"Processing batch {batch_start//batch_size + 1}/{(len(fires)-1)//batch_size + 1}: "
+              f"fires {batch_start+1}-{batch_end}")
+        
+        # Process this batch
+        X_batch, y_batch = extract_spatial_grid_features(
+            batch_fires, grid_size, use_parallel, n_jobs
+        )
+        
+        if len(X_batch) > 0:
+            all_features.append(X_batch)
+            all_targets.append(y_batch)
+            total_points += len(X_batch)
+            print(f"Batch {batch_start//batch_size + 1} yielded {len(X_batch)} samples")
+    
+    if len(all_features) == 0:
+        return np.array([]), np.array([])
+    
+    # Concatenate all batches
+    print("Combining all batches...")
+    X = np.vstack(all_features)
+    y = np.hstack(all_targets)
+    
+    print(f"Total features extracted: {total_points}")
+    
+    return X, y
+
+
+def extract_spatial_grid_features(fires: List[FireDataset], grid_size: int = 9, 
+                                 use_parallel: bool = True, n_jobs: int = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract 9x9 spatial grid features for fire spread prediction with parallel processing.
+    Only considers points with burn_decay=0 in current day to predict fire spread.
+    
+    Parameters:
+    -----------
+    fires : List[FireDataset]
+        List of compiled fire datasets
+    grid_size : int
+        Size of the spatial grid (default: 9 for 9x9)
+    use_parallel : bool
+        Whether to use parallel processing (default: True)
+    n_jobs : int
+        Number of parallel jobs (default: number of CPU cores)
+    
+    Returns:
+    --------
+    X : np.ndarray
+        Feature matrix of shape (n_samples, n_features)
+        where n_features = grid_size^2 * 8 (8 variables per grid cell)
+        Only includes points that had burn_decay=0 in current day
+    y : np.ndarray
+        Binary target vector (1 if fire spread occurred: burn_decay 0->1, 0 otherwise)
+    """
+    print(f"Extracting {grid_size}x{grid_size} spatial grid features for fire spread prediction...")
+    print("Only considering points with burn_decay=0 in current day")
+    
+    # All ground data variables
+    variable_names = [
+        'avg_surf_temp', 'rainfall', 'vegetation_transpiration', 'wind_speed',
+        'air_temp', 'air_humidity', 'soil_moisture', 'soil_temp'
+    ]
+    
+    # Prepare data for processing
+    fire_day_pairs = []
+    for fire_idx, fire in enumerate(fires):
+        for day_idx in range(len(fire.daily_data) - 1):  # Exclude last day
+            current_day = fire.daily_data[day_idx]
+            next_day = fire.daily_data[day_idx + 1]
+            
+            # Skip if either day lacks ground data
+            if (current_day.has_ground_data and next_day.has_ground_data and
+                len(current_day.ground_data.coordinates) > 0 and
+                len(next_day.ground_data.coordinates) > 0):
+                fire_day_pairs.append((fire_idx, fire, day_idx, current_day, next_day))
+    
+    print(f"Found {len(fire_day_pairs)} fire-day pairs to process")
+    
+    if use_parallel and len(fire_day_pairs) > 1:
+        n_jobs = n_jobs or min(cpu_count(), len(fire_day_pairs))
+        print(f"Using {n_jobs} parallel processes")
+        
+        # Create partial function with fixed parameters
+        process_func = partial(
+            process_fire_day_pair_optimized,
+            grid_size=grid_size,
+            variable_names=variable_names
+        )
+        
+        # Process in parallel
+        with Pool(n_jobs) as pool:
+            results = pool.map(process_func, fire_day_pairs)
+    else:
+        print("Using sequential processing")
+        results = []
+        for i, fire_day_pair in enumerate(fire_day_pairs):
+            if i % 10 == 0:
+                print(f"Processing pair {i+1}/{len(fire_day_pairs)}")
+            result = process_fire_day_pair_optimized(fire_day_pair, grid_size, variable_names)
+            results.append(result)
+    
+    # Combine results
+    all_features = []
+    all_targets = []
+    total_points_processed = 0
+    
+    for features, targets in results:
+        if len(features) > 0:
+            all_features.extend(features)
+            all_targets.extend(targets)
+            total_points_processed += len(features)
+    
+    if len(all_features) == 0:
+        print("No features extracted!")
+        return np.array([]), np.array([])
+    
+    X = np.array(all_features)
+    y = np.array(all_targets)
+    
+    print(f"Extracted features for {total_points_processed} data points")
+    print(f"Positive targets: {np.sum(y)} ({np.mean(y)*100:.1f}%)")
+    
+    return X, y
+
+
+def process_fire_day_pair_optimized(fire_day_pair, grid_size, variable_names):
+    """
+    Process a single fire-day pair to extract features for fire spread prediction.
+    Only considers points with burn_decay=0 in current day (outside burned areas).
+    
+    Returns:
+    --------
+    tuple: (features_list, targets_list)
+    """
+    fire_idx, fire, day_idx, current_day, next_day = fire_day_pair
+    
+    current_coords = np.array(current_day.ground_data.coordinates)
+    current_burn_decay = np.array(current_day.ground_data.burn_decay)
+    next_coords = np.array(next_day.ground_data.coordinates)
+    next_burn_decay = np.array(next_day.ground_data.burn_decay)
+    
+    # Create spatial index for current day coordinates
+    tree = KDTree(current_coords)
+    
+    # Pre-extract all variable data for current day
+    current_vars = {}
+    for var_name in variable_names:
+        current_vars[var_name] = np.array(getattr(current_day.ground_data, var_name))
+    
+    features_list = []
+    targets_list = []
+    
+    # Vectorized processing where possible
+    grid_spacing = 0.009  # roughly 1km at mid-latitudes
+    half_size = grid_size // 2
+    
+    # Process each target point
+    for target_idx, (target_lat, target_lon) in enumerate(next_coords):
+        try:
+            # First check if this point had burn_decay=0 in current day
+            # Find closest point in current day to this target location
+            distances, indices = tree.query([[target_lat, target_lon]], k=1, distance_upper_bound=grid_spacing * 0.5)
+            
+            # Skip if no nearby point found or if the nearby point has burn_decay > 0
+            if np.isinf(distances[0]) or current_burn_decay[indices[0]] > 0:
+                continue
+            
+            # Extract grid features using optimized method
+            grid_features = extract_grid_around_point_vectorized(
+                target_lat, target_lon, 
+                current_vars, tree, current_coords,
+                grid_size, variable_names, grid_spacing, half_size
+            )
+            
+            if grid_features is not None:
+                # Create binary target (fire spread: 0 -> >0)
+                target_burn_decay = next_burn_decay[target_idx]
+                binary_target = 1 if target_burn_decay > 0 else 0
+                
+                features_list.append(grid_features)
+                targets_list.append(binary_target)
+                
+        except Exception as e:
+            continue  # Skip problematic points
+    
+    return features_list, targets_list
+
+
+def extract_grid_around_point_vectorized(target_lat: float, target_lon: float,
+                                        current_vars: Dict[str, np.ndarray],
+                                        tree: KDTree, coord_array: np.ndarray,
+                                        grid_size: int, variable_names: List[str],
+                                        grid_spacing: float, half_size: int) -> Optional[np.ndarray]:
+    """
+    Optimized vectorized grid extraction around a target point.
+    """
+    # Generate all grid coordinates at once
+    i_indices = np.arange(grid_size)
+    j_indices = np.arange(grid_size)
+    ii, jj = np.meshgrid(i_indices, j_indices, indexing='ij')
+    
+    # Calculate all grid cell coordinates vectorized
+    lat_offsets = (ii - half_size) * grid_spacing
+    lon_offsets = (jj - half_size) * grid_spacing
+    
+    cell_lats = target_lat + lat_offsets.flatten()
+    cell_lons = target_lon + lon_offsets.flatten()
+    
+    # Query all points at once
+    grid_coords = np.column_stack([cell_lats, cell_lons])
+    distances, indices = tree.query(grid_coords, k=1, distance_upper_bound=grid_spacing * 1.5)
+    
+    # Initialize output grid
+    grid_features = np.full((grid_size, grid_size, len(variable_names)), np.nan)
+    
+    # Fill grid efficiently
+    valid_mask = ~np.isinf(distances)
+    valid_indices = indices[valid_mask]
+    valid_positions = np.where(valid_mask)[0]
+    
+    for pos_idx, data_idx in zip(valid_positions, valid_indices):
+        i = pos_idx // grid_size
+        j = pos_idx % grid_size
+        
+        for var_idx, var_name in enumerate(variable_names):
+            value = current_vars[var_name][data_idx]
+            if not np.isnan(value):
+                grid_features[i, j, var_idx] = value
+    
+    # Check data sufficiency
+    total_cells = grid_size * grid_size * len(variable_names)
+    filled_cells = np.sum(~np.isnan(grid_features))
+    
+    if filled_cells < total_cells * 0.25:
+        return None
+    
+    # Fill remaining NaN values efficiently
+    for var_idx in range(len(variable_names)):
+        var_slice = grid_features[:, :, var_idx]
+        if np.all(np.isnan(var_slice)):
+            # Use global mean for this variable
+            var_data = current_vars[variable_names[var_idx]]
+            clean_values = var_data[~np.isnan(var_data)]
+            if len(clean_values) > 0:
+                grid_features[:, :, var_idx] = np.mean(clean_values)
+            else:
+                grid_features[:, :, var_idx] = 0.0
+        else:
+            # Use local mean
+            var_mean = np.nanmean(var_slice)
+            if not np.isnan(var_mean):
+                var_slice[np.isnan(var_slice)] = var_mean
+            else:
+                var_slice[np.isnan(var_slice)] = 0.0
+    
+    return grid_features.flatten()
+
+
+def extract_grid_around_point(target_lat: float, target_lon: float,
+                            ground_data: 'DayGroundData',
+                            tree: KDTree, coord_array: np.ndarray,
+                            grid_size: int, variable_names: List[str]) -> Optional[np.ndarray]:
+    """
+    Extract grid features around a target point.
+    
+    Parameters:
+    -----------
+    target_lat, target_lon : float
+        Coordinates of the target point (center of grid)
+    ground_data : DayGroundData
+        Ground data for the day
+    tree : KDTree
+        Spatial index for coordinates
+    coord_array : np.ndarray
+        Array of coordinates for KDTree
+    grid_size : int
+        Size of the grid (e.g., 9 for 9x9)
+    variable_names : List[str]
+        Names of variables to extract
+    
+    Returns:
+    --------
+    np.ndarray or None
+        Flattened grid features or None if insufficient data
+    """
+    # Define grid spacing (in degrees - approximately 1km spacing)
+    grid_spacing = 0.009  # roughly 1km at mid-latitudes
+    half_size = grid_size // 2
+    
+    # Initialize grid for each variable
+    grid_features = np.full((grid_size, grid_size, len(variable_names)), np.nan)
+    
+    # Get variable data arrays
+    variable_data = {}
+    for var_name in variable_names:
+        variable_data[var_name] = getattr(ground_data, var_name)
+    
+    # Fill grid
+    for i in range(grid_size):
+        for j in range(grid_size):
+            # Calculate grid cell center coordinates
+            lat_offset = (i - half_size) * grid_spacing
+            lon_offset = (j - half_size) * grid_spacing
+            
+            cell_lat = target_lat + lat_offset
+            cell_lon = target_lon + lon_offset
+            
+            # Find nearest neighbor within reasonable distance
+            try:
+                distances, indices = tree.query([cell_lat, cell_lon], k=1, distance_upper_bound=grid_spacing * 1.5)
+                
+                if not np.isinf(distances):  # Found a neighbor
+                    neighbor_idx = indices
+                    
+                    # Extract all variables for this neighbor
+                    for var_idx, var_name in enumerate(variable_names):
+                        value = variable_data[var_name][neighbor_idx]
+                        if not pd.isna(value):
+                            grid_features[i, j, var_idx] = value
+                            
+            except Exception as e:
+                continue
+    
+    # Check if we have sufficient data (at least 25% of grid cells filled)
+    total_cells = grid_size * grid_size * len(variable_names)
+    filled_cells = np.sum(~np.isnan(grid_features))
+    
+    if filled_cells < total_cells * 0.25:
+        return None
+    
+    # Replace remaining NaN values with mean of available values for each variable
+    for var_idx in range(len(variable_names)):
+        var_slice = grid_features[:, :, var_idx]
+        if np.all(np.isnan(var_slice)):
+            # If all NaN for this variable, use global mean
+            var_data = variable_data[variable_names[var_idx]]
+            clean_values = [v for v in var_data if not pd.isna(v)]
+            if clean_values:
+                grid_features[:, :, var_idx] = np.mean(clean_values)
+            else:
+                grid_features[:, :, var_idx] = 0.0
+        else:
+            # Use mean of available values in this grid
+            var_mean = np.nanmean(var_slice)
+            if not np.isnan(var_mean):
+                var_slice[np.isnan(var_slice)] = var_mean
+            else:
+                var_slice[np.isnan(var_slice)] = 0.0
+    
+    # Flatten to 1D feature vector
+    return grid_features.flatten()
+
+
+def train_svm_classifier(X_train: np.ndarray, y_train: np.ndarray) -> Tuple[SVC, StandardScaler]:
+    """
+    Train SVM classifier on spatial grid features with memory optimization.
+    
+    Parameters:
+    -----------
+    X_train : np.ndarray
+        Training features
+    y_train : np.ndarray
+        Training targets
+    
+    Returns:
+    --------
+    svm_model : SVC
+        Trained SVM classifier
+    scaler : StandardScaler
+        Fitted feature scaler
+    """
+    print("Scaling features...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    
+    print("Training SVM...")
+    print(f"Training data shape: {X_train_scaled.shape}")
+    print(f"Class distribution: {np.bincount(y_train)}")
+    
+    # For large datasets, use a subset for initial training
+    if len(X_train_scaled) > 10000:
+        print("Large dataset detected, using stratified subset for faster training")
+        from sklearn.model_selection import train_test_split
+        X_subset, _, y_subset, _ = train_test_split(
+            X_train_scaled, y_train, 
+            train_size=10000, 
+            stratify=y_train, 
+            random_state=42
+        )
+        X_train_scaled = X_subset
+        y_train = y_subset
+        print(f"Using subset of size: {X_train_scaled.shape}")
+    
+    # Use balanced class weights to handle imbalanced data
+    svm_model = SVC(
+        kernel='rbf',
+        C=1.0,
+        gamma='scale',
+        class_weight='balanced',
+        random_state=42,
+        cache_size=1000  # Increase cache size for better performance
+    )
+    
+    svm_model.fit(X_train_scaled, y_train)
+    
+    print(f"SVM training complete. Support vectors: {svm_model.n_support_}")
+    
+    return svm_model, scaler
+
+
+def evaluate_svm_model(svm_model: SVC, scaler: StandardScaler, 
+                      X_test: np.ndarray, y_test: np.ndarray):
+    """
+    Evaluate trained SVM model on test data.
+    
+    Parameters:
+    -----------
+    svm_model : SVC
+        Trained SVM classifier
+    scaler : StandardScaler
+        Fitted feature scaler
+    X_test : np.ndarray
+        Test features
+    y_test : np.ndarray
+        Test targets
+    """
+    print("Scaling test features...")
+    X_test_scaled = scaler.transform(X_test)
+    
+    print("Making predictions...")
+    y_pred = svm_model.predict(X_test_scaled)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    print(f"\n=== SVM Model Evaluation ===")
+    print(f"Test Accuracy: {accuracy:.4f}")
+    print(f"Test samples: {len(y_test)}")
+    print(f"Positive predictions: {np.sum(y_pred)} ({np.mean(y_pred)*100:.1f}%)")
+    print(f"Actual positives: {np.sum(y_test)} ({np.mean(y_test)*100:.1f}%)")
+    
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, target_names=['No Burn', 'Burn']))
+    
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+
 def main():
+    import time
+    start_time = time.time()
+    
     fire_id_to_inspect = 2563
     date_to_inspect_str = "2018-09-13"
     target_date = datetime.strptime(date_to_inspect_str, "%Y-%m-%d").date()
 
-    print(f"--- Processing Fire {fire_id_to_inspect} for Burn Decay Analysis ---")
+    print(f"--- Fire Spread Prediction System ---")
+    print(f"Predicting fire spread from unburned areas (burn_decay=0 -> burn_decay>0)")
+    print(f"Processing Fire {fire_id_to_inspect} for analysis")
     print(f"Target date for inspection: {target_date.strftime('%Y-%m-%d')}")
+    print(f"Available CPU cores: {cpu_count()}")
 
     compiler = FireDataCompiler()
     try:
         print("Loading data...")
+        load_start = time.time()
         compiler.load_data()
+        print(f"Data loading took {time.time() - load_start:.2f} seconds")
     except Exception as e:
         print(f"Error loading data: {e}")
         return
 
-    fire_dataset = None
-    
-    # Complie all fires in the dataset
+    # Compile all fires in the dataset
+    print("Compiling fires...")
+    compile_start = time.time()
     compiled_fires = compiler.compile_all_fires()
+    print(f"Fire compilation took {time.time() - compile_start:.2f} seconds")
+    print(f"Total fires compiled: {len(compiled_fires)}")
+
+    # For faster testing, limit the number of fires
+    max_fires_for_testing = 50  # Adjust this number based on your needs
+    if len(compiled_fires) > max_fires_for_testing:
+        print(f"Limiting to first {max_fires_for_testing} fires for faster processing")
+        compiled_fires = compiled_fires[:max_fires_for_testing]
 
     # Split the fires into training and testing sets
     train_fires, test_fires = train_test_split(compiled_fires, test_size=0.2, random_state=42)
-    X_train = []
-    y_train = []
+    
+    print(f"Training fires: {len(train_fires)}")
+    print(f"Test fires: {len(test_fires)}")
 
-    for fire in train_fires:
-        for day_data in fire.daily_data:
-            X_train_day = []
-            for ground_data in day_data.ground_data:
-                X_train_day.append(ground_data.burn_decay)
-                X_train_day.append(ground_data.avg_surf_temp)
-                X_train_day.append(ground_data.rainfall)
-                X_train_day.append(ground_data.vegetation_transpiration)
-                X_train_day
+    if len(train_fires) > 0 and len(train_fires[0].daily_data) > 0:
+        coords_of_fire_1 = train_fires[0].daily_data[0].ground_data.coordinates
+        print(f"Sample coordinates from first fire: {len(coords_of_fire_1)} points")
+    
+    # Extract spatial grid features for fire spread prediction (only burn_decay=0 points)
+    print("Extracting spatial grid features for fire spread training...")
+    print("(Only considering points with burn_decay=0 in current day)")
+    feature_start = time.time()
+    
+    # Use batched processing for larger datasets
+    if len(train_fires) > 20:
+        print("Using batched processing for large dataset")
+        X_train, y_train = extract_spatial_grid_features_batched(
+            train_fires, batch_size=10, use_parallel=True
+        )
+    else:
+        X_train, y_train = extract_spatial_grid_features(train_fires, use_parallel=True)
+    
+    feature_time = time.time() - feature_start
+    print(f"Training feature extraction took {feature_time:.2f} seconds")
+    print(f"Training features shape: {X_train.shape}")
+    print(f"Training labels shape: {y_train.shape}")
+    print(f"Fire spread cases (burn_decay 0->1): {np.sum(y_train)} out of {len(y_train)} total points")
+    
+    if X_train.size == 0:
+        print("Error: No training features extracted!")
+        return
+    
+    # Extract spatial grid features for testing
+    print("Extracting spatial grid features for fire spread testing...")
+    test_feature_start = time.time()
+    
+    if len(test_fires) > 20:
+        print("Using batched processing for large test dataset")
+        X_test, y_test = extract_spatial_grid_features_batched(
+            test_fires, batch_size=10, use_parallel=True
+        )
+    else:
+        X_test, y_test = extract_spatial_grid_features(test_fires, use_parallel=True)
+    test_feature_time = time.time() - test_feature_start
+    print(f"Test feature extraction took {test_feature_time:.2f} seconds")
+    print(f"Test features shape: {X_test.shape}")
+    print(f"Test labels shape: {y_test.shape}")
+    print(f"Test fire spread cases (burn_decay 0->1): {np.sum(y_test)} out of {len(y_test)} total points")
+    
+    if X_test.size == 0:
+        print("Warning: No test features extracted! Using a subset of training data for testing.")
+        # Split training data for testing
+        X_train, X_test, y_train, y_test = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+        
+    # Train SVM classifier for fire spread prediction
+    print("Training SVM classifier for fire spread prediction...")
+    train_start = time.time()
+    svm_model, scaler = train_svm_classifier(X_train, y_train)
+    train_time = time.time() - train_start
+    print(f"SVM training took {train_time:.2f} seconds")
+    
+    # Evaluate fire spread prediction model
+    print("Evaluating fire spread prediction model...")
+    eval_start = time.time()
+    evaluate_svm_model(svm_model, scaler, X_test, y_test)
+    eval_time = time.time() - eval_start
+    print(f"Model evaluation took {eval_time:.2f} seconds")
+    
+    total_time = time.time() - start_time
+    print(f"\n=== Fire Spread Prediction Performance Summary ===")
+    print(f"Total execution time: {total_time:.2f} seconds")
+    print(f"Data loading: {load_start and (compile_start - load_start):.2f}s")
+    print(f"Fire compilation: {compile_start and (feature_start - compile_start):.2f}s") 
+    print(f"Feature extraction: {feature_time + test_feature_time:.2f}s")
+    print(f"Model training: {train_time:.2f}s")
+    print(f"Model evaluation: {eval_time:.2f}s")
+    print(f"System focuses on predicting fire spread from unburned areas only")
+                
 
-    print(f"Total fires compiled: {len(compiled_fires)}")
+
+
+    
 
     
 
@@ -1006,66 +1579,21 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def translate_multipolygon_for_ml(multipolygon, method='radial', n_params=36):
+
+def translate_multipolygon_for_ml(polygon, method='radial', n_params=36):
     """
-    Translate a shapely MultiPolygon object into a numerical feature vector for machine learning.
+    Convert polygon to numerical features for ML (stub function).
     
-    This function converts complex polygon shapes into a standardized numerical representation
-    that can be used as input to machine learning models. Two parameterization methods are 
-    supported:
-    
-    Parameters:
-    -----------
-    multipolygon : shapely.geometry.multipolygon.MultiPolygon or shapely.geometry.polygon.Polygon
-        The input polygon geometry to convert
-    method : str, default='radial'
-        The parameterization method to use:
-        - 'radial': Centroid + radial distances (recommended for fire perimeters)
-        - 'coordinates': Fixed number of coordinate pairs
-    n_params : int, default=36
-        Number of parameters for the parameterization:
-        - For 'radial': Number of radial rays (total features = n_params + 2 for centroid)
-        - For 'coordinates': Number of coordinate pairs (total features = n_params * 2)
-    
-    Returns:
-    --------
-    np.ndarray
-        Feature vector representing the polygon:
-        - For 'radial' method: [centroid_x, centroid_y, dist_0, dist_1, ..., dist_n]
-        - For 'coordinates' method: [x_0, y_0, x_1, y_1, ..., x_n, y_n]
-    
-    Examples:
-    ---------
-    >>> from shapely.geometry import Polygon, MultiPolygon
-    >>> # Single polygon
-    >>> poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
-    >>> features = translate_multipolygon_for_ml(poly)
-    >>> print(features.shape)  # (38,) for default radial with 36 params
-    
-    >>> # MultiPolygon (will use largest component)
-    >>> multi = MultiPolygon([poly, Polygon([(2, 2), (3, 2), (3, 3), (2, 3)])])
-    >>> features = translate_multipolygon_for_ml(multi)
-    
-    >>> # Different parameterization
-    >>> features_coords = translate_multipolygon_for_ml(poly, method='coordinates', n_params=20)
-    >>> print(features_coords.shape)  # (40,) for 20 coordinate pairs
+    This is a simplified version for compatibility with existing code.
     """
-    
-    # Handle MultiPolygon by taking the largest component
-    if isinstance(multipolygon, MultiPolygon):
-        # Take the polygon with the largest area
-        polygon = max(multipolygon.geoms, key=lambda p: p.area)
-    elif isinstance(multipolygon, Polygon):
-        polygon = multipolygon
-    else:
-        raise ValueError(f"Input must be a Polygon or MultiPolygon, got {type(multipolygon)}")
-    
     if method == 'radial':
         return _polygon_to_radial_features(polygon, n_params)
     elif method == 'coordinates':
         return _polygon_to_coordinate_features(polygon, n_params)
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'radial' or 'coordinates'")
+        # Default: return simple centroid + area features
+        centroid = polygon.centroid
+        return np.array([centroid.x, centroid.y, polygon.area])
 
 
 def _polygon_to_radial_features(polygon, n_radial=36):
